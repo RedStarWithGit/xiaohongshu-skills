@@ -84,6 +84,16 @@ class CDPError(XHSError):
     """CDP 通信异常。"""
 
 
+class BridgeAuthError(XHSError):
+    """Bridge WebSocket 认证失败。"""
+
+    def __init__(
+        self,
+        message: str = "bridge 认证失败，请检查 ~/.xhs/bridge_secret 与扩展 popup 配置是否一致",
+    ) -> None:
+        super().__init__(message)
+
+
 class ElementNotFoundError(XHSError):
     """页面元素未找到。"""
 
