@@ -72,6 +72,14 @@ uv sync
 
 安装完成后即可使用 — 所有操作都发生在你自己的浏览器里，使用你的真实账号和浏览器环境。
 
+#### Bridge 配对（首次使用必须）
+
+CLI 与扩展之间的本地通信（`ws://localhost:9333`）受鉴权保护，首次使用需完成配对：
+
+1. CLI 首次运行时会自动生成配对密钥文件 `~/.xhs/bridge_secret`（无需手动创建）
+2. 打开扩展 popup 的「Bridge 配对」，把 `~/.xhs/bridge_secret` 文件的内容完整粘贴进去并保存
+3. 配对完成后扩展即可连接 bridge server；若更换密钥文件，需在 popup 中重新粘贴
+
 ## 使用方式
 
 ### 作为 AI Agent 技能使用（推荐）
@@ -151,7 +159,7 @@ python scripts/cli.py post-comment --feed-id FEED_ID --xsec-token XSEC_TOKEN --c
 |--------|------|
 | `check-login` | 检查登录状态，返回用户昵称和小红书号 |
 | `login` | 获取登录二维码，等待扫码，登录后返回用户信息 |
-| `delete-cookies` | 清除 cookies（退出登录） |
+| `delete-cookies` | 退出登录（页面 UI 操作） |
 | `list-feeds` | 获取首页推荐 Feed |
 | `search-feeds` | 关键词搜索笔记（支持排序/类型/时间/范围/位置筛选） |
 | `get-feed-detail` | 获取笔记完整内容和评论 |
@@ -171,6 +179,8 @@ python scripts/cli.py post-comment --feed-id FEED_ID --xsec-token XSEC_TOKEN --c
 | `next-step` | 长文下一步 + 填写描述 |
 
 退出码：`0` 成功 · `1` 未登录 · `2` 错误
+
+> **调试**：设置环境变量 `XHS_DEBUG=1` 可在命令失败时输出详细 traceback，便于排查问题。
 
 ## 项目结构
 
@@ -197,7 +207,6 @@ xiaohongshu-skills/
 │   │   ├── types.py                # 数据类型
 │   │   ├── errors.py               # 异常体系
 │   │   ├── urls.py                 # URL 常量
-│   │   ├── cookies.py              # Cookie 持久化
 │   │   └── human.py                # 行为模拟
 │   ├── cli.py                      # 统一 CLI 入口
 │   ├── bridge_server.py            # 本地通信服务

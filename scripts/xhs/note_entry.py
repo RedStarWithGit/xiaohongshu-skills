@@ -19,6 +19,7 @@ import time
 from .cdp import Page
 from .errors import PageNotAccessibleError
 from .human import HOVER_TIME, REACTION_TIME, sleep_random
+from .redact import redact_url
 from .selectors import NOTE_MODAL_CLOSE
 from .urls import make_feed_detail_url, make_search_url
 
@@ -98,7 +99,7 @@ def _open_by_click(page: Page, feed_id: str, keyword: str) -> bool:
         _close_note_modal_if_open(page)
     else:
         search_url = make_search_url(keyword)
-        logger.info("打开搜索结果页: %s", search_url)
+        logger.info("打开搜索结果页: %s", redact_url(search_url))
         page.navigate(search_url)
         page.wait_for_load()
         page.wait_dom_stable()
@@ -213,7 +214,7 @@ def _open_by_url(page: Page, feed_id: str, xsec_token: str) -> None:
     此处只捕获真正的瞬态错误（网络超时等），风控拦截不重试。
     """
     url = make_feed_detail_url(feed_id, xsec_token)
-    logger.info("URL 直达详情页: %s", url)
+    logger.info("URL 直达详情页: %s", redact_url(url))
     for attempt in range(3):
         try:
             page.navigate(url)

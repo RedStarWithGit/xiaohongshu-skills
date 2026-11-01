@@ -6,17 +6,31 @@
  * - evaluate / has_element 等: chrome.scripting.executeScript (MAIN world)
  * - click / input 等 DOM 操作: chrome.tabs.sendMessage → content.js
  * - screenshot: chrome.tabs.captureVisibleTab
- * - get_cookies: chrome.cookies.getAll
+ *
+ * 握手鉴权：连接后首条消息发送 { role: "extension", auth: <bridgeSecret> }。
+ * bridgeSecret 存于 chrome.storage.local（用户在 popup 配对区粘贴，与
+ * ~/.xhs/bridge_secret 文件内容一致）。server 校验失败会回发
+ * { type: "auth_error" } 并关闭连接，此时按指数退避重连（初始 5s、上限 5min）。
  */
 
 importScripts("netlogger.js");
 netlogInit().catch(e => console.warn("[XHS NetLogger] init failed", e));
 
 const BRIDGE_URL = "ws://localhost:9333";
+const BRIDGE_SECRET_KEY = "bridgeSecret";
+const BRIDGE_BACKOFF_KEY = "bridgeBackoffMs";
+const BRIDGE_NEXT_ATTEMPT_KEY = "bridgeNextAttemptAt";   // 下次允许尝试连接的时间戳（重连闸门）
+const BRIDGE_STATE_KEY = "bridgeState";
+const BRIDGE_BACKOFF_INITIAL_MS = 5000;
+const BRIDGE_BACKOFF_MAX_MS = 5 * 60 * 1000;
+
 let ws = null;
+let _reconnectTimer = null;
+let _lastBridgeState = null;   // 去重日志/通知用
 
 // 保持 service worker 存活：有开放的 WebSocket 连接时 Chrome 不会终止 SW
-// 额外加 alarm 作为保底
+// 额外加 alarm 作为保底（重连节奏由 connect() 内的重连闸门统一控制，
+// 避免认证失败时 alarm 每 ~24s 绕过指数退避永久重连）
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener(() => {
   if (!ws || ws.readyState !== WebSocket.OPEN) connect();
@@ -28,17 +42,44 @@ function setStatus(connected) {
   chrome.storage.session.set({ wsConnected: connected });
 }
 
-function broadcastStatus() {
-  const status = { wsConnected: ws !== null && ws.readyState === WebSocket.OPEN };
-  chrome.runtime.sendMessage({ type: "STATUS_CHANGED", status }).catch(() => {});
+/**
+ * 桥接状态机：connected / auth_failed / unconfigured / disconnected。
+ * 持久化到 chrome.storage.local，供 SW 休眠重启后恢复、popup 读取。
+ */
+async function setBridgeState(state) {
+  _lastBridgeState = state;
+  try {
+    await chrome.storage.local.set({
+      [BRIDGE_STATE_KEY]: state,
+      wsConnected: state === "connected",
+    });
+  } catch (_) {}
+  chrome.runtime.sendMessage({
+    type: "STATUS_CHANGED",
+    status: { wsConnected: state === "connected", bridgeState: state },
+  }).catch(() => {});
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "GET_STATUS") {
-    sendResponse({
-      success: true,
-      status: { wsConnected: ws !== null && ws.readyState === WebSocket.OPEN },
+    chrome.storage.local.get([BRIDGE_SECRET_KEY, BRIDGE_STATE_KEY], (data) => {
+      const connected = ws !== null && ws.readyState === WebSocket.OPEN;
+      const hasSecret = !!data[BRIDGE_SECRET_KEY];
+      let bridgeState = data[BRIDGE_STATE_KEY] || (connected ? "connected" : "disconnected");
+      if (!hasSecret) bridgeState = "unconfigured";
+      else if (!connected && bridgeState === "connected") bridgeState = "disconnected";
+      sendResponse({
+        success: true,
+        status: { wsConnected: connected, bridgeState },
+      });
     });
+    return true;
+  }
+
+  // popup 保存/清除 bridgeSecret 后通知：重置退避并立即重连（或停止连接）
+  if (msg.type === "BRIDGE_SECRET_CHANGED") {
+    resetBridgeForReconnect();
+    sendResponse({ ok: true });
     return true;
   }
 
@@ -88,16 +129,34 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
-function connect() {
+async function connect() {
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+
+  // bridgeSecret 未配置：不发起连接，等待 popup 配置
+  const data = await chrome.storage.local
+    .get([BRIDGE_SECRET_KEY, BRIDGE_BACKOFF_KEY, BRIDGE_NEXT_ATTEMPT_KEY])
+    .catch(() => ({}));
+  const secret = data[BRIDGE_SECRET_KEY];
+  if (!secret) {
+    if (_lastBridgeState !== "unconfigured") {
+      console.warn("[XHS Bridge] 未配置 bridgeSecret，跳过连接（请在扩展 popup 的 Bridge 配对区粘贴密钥）");
+      await setBridgeState("unconfigured");
+    }
+    return;
+  }
+
+  // 重连闸门：退避期内（含 keepAlive alarm / SW 休眠重启后的触发）一律不放行。
+  // 时间戳存 chrome.storage.local，SW 重启后闸门天然持久。
+  if (Date.now() < (data[BRIDGE_NEXT_ATTEMPT_KEY] || 0)) return;
 
   ws = new WebSocket(BRIDGE_URL);
 
   ws.onopen = () => {
-    console.log("[XHS Bridge] 已连接到 bridge server");
-    ws.send(JSON.stringify({ role: "extension" }));
+    console.log("[XHS Bridge] 已连接到 bridge server，发送握手鉴权...");
+    // 鉴权握手：secret 只经本地 WS 发给 bridge server，不得写入任何日志
+    ws.send(JSON.stringify({ role: "extension", auth: secret }));
     setStatus(true);
-    broadcastStatus();
+    setBridgeState("connected");
   };
 
   ws.onmessage = async (event) => {
@@ -107,6 +166,28 @@ function connect() {
     } catch {
       return;
     }
+
+    // 鉴权失败：server 校验不通过会发送 auth_error 后关闭连接。
+    // 禁止无限快速重连 —— 走指数退避（chrome.storage.local 持久化，SW 重启后仍生效），
+    // 标记认证失败状态并通知 popup。
+    if (msg.type === "auth_error") {
+      console.warn(
+        "[XHS Bridge] 认证失败：bridge server 拒绝了密钥。" +
+        "请检查扩展 popup 配置的密钥与 ~/.xhs/bridge_secret 是否一致。",
+      );
+      await setBridgeState("auth_failed");
+      try { ws.close(); } catch (_) {}
+      return;
+    }
+
+    // 收到正常命令 = 鉴权已通过：重置退避、清除重连闸门
+    if (data[BRIDGE_BACKOFF_KEY]) {
+      await chrome.storage.local.set({ [BRIDGE_BACKOFF_KEY]: BRIDGE_BACKOFF_INITIAL_MS }).catch(() => {});
+    }
+    if (data[BRIDGE_NEXT_ATTEMPT_KEY]) {
+      await chrome.storage.local.remove(BRIDGE_NEXT_ATTEMPT_KEY).catch(() => {});
+    }
+
     try {
       const result = await handleCommand(msg);
       ws.send(JSON.stringify({ id: msg.id, result: result ?? null }));
@@ -116,15 +197,58 @@ function connect() {
   };
 
   ws.onclose = () => {
-    console.log("[XHS Bridge] 连接断开，3s 后重连...");
+    console.log("[XHS Bridge] 连接断开，按退避策略重连...");
     setStatus(false);
-    broadcastStatus();
-    setTimeout(connect, 3000);
+    scheduleReconnect();
   };
 
   ws.onerror = (e) => {
     console.error("[XHS Bridge] WS 错误", e);
   };
+}
+
+/**
+ * 指数退避重连：延迟从 chrome.storage.local 读取（初始 5s，翻倍，上限 5min），
+ * SW 休眠重启后状态可恢复。
+ */
+function scheduleReconnect() {
+  if (_reconnectTimer) return;
+  chrome.storage.local.get([BRIDGE_BACKOFF_KEY]).then((store) => {
+    const delay = Math.min(
+      store[BRIDGE_BACKOFF_KEY] || BRIDGE_BACKOFF_INITIAL_MS,
+      BRIDGE_BACKOFF_MAX_MS,
+    );
+    console.log(`[XHS Bridge] ${Math.round(delay / 1000)}s 后重连...`);
+    // 记录下次允许尝试的时间戳：即使 setTimeout 丢失 / keepAlive alarm 提前触发，
+    // connect() 也会被该闸门拦截（存 storage，SW 重启后仍生效）
+    chrome.storage.local
+      .set({ [BRIDGE_NEXT_ATTEMPT_KEY]: Date.now() + delay })
+      .catch(() => {});
+    _reconnectTimer = setTimeout(async () => {
+      _reconnectTimer = null;
+      await chrome.storage.local
+        .set({ [BRIDGE_BACKOFF_KEY]: Math.min(delay * 2, BRIDGE_BACKOFF_MAX_MS) })
+        .catch(() => {});
+      connect();
+    }, delay);
+  }).catch(() => {});
+}
+
+/** popup 修改 bridgeSecret 后调用：清除退避定时器、重连闸门与状态，立即重连/停连 */
+function resetBridgeForReconnect() {
+  if (_reconnectTimer) {
+    clearTimeout(_reconnectTimer);
+    _reconnectTimer = null;
+  }
+  chrome.storage.local.set({ [BRIDGE_BACKOFF_KEY]: BRIDGE_BACKOFF_INITIAL_MS }).catch(() => {});
+  chrome.storage.local.remove(BRIDGE_NEXT_ATTEMPT_KEY).catch(() => {});
+  if (ws) {
+    try { ws.onclose = null; } catch (_) {}
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  setStatus(false);
+  connect();
 }
 
 // ───────────────────────── 命令路由 ─────────────────────────
@@ -178,9 +302,8 @@ async function handleCommand(msg) {
       await chrome.storage.session.set({ blockEvents: [] });
       return null;
 
-    // ── Cookies ──
-    case "get_cookies":
-      return await cmdGetCookies(params);
+    // 注：get_cookies 命令已移除（安全审计 P0：避免全量 cookie 含
+    // HttpOnly web_session 经 bridge 暴露给任意本地进程）
 
     // ── 在页面主 world 执行 JS（可访问 window.__INITIAL_STATE__ 等） ──
     case "evaluate":
@@ -214,6 +337,26 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
     target: { tabId },
     world: "MAIN",
     func: (targetUrl, landedUrl) => {
+      // ── 0. 自包含脱敏工具（MAIN world 不可引用 SW 侧的 redactUrl/redactToken）──
+      // URL 脱敏：query 中 xsec_token 值替换为「前 8 字符 + …」，与 netlogger.js 规则一致
+      function redactMini(url) {
+        if (typeof url !== "string" || !url.includes("xsec_token=")) return url;
+        try {
+          const u = new URL(url, location.origin);
+          const t = u.searchParams.get("xsec_token");
+          if (t) u.searchParams.set("xsec_token", t.slice(0, 8) + "…");
+          return u.toString();
+        } catch (_) {
+          return url.replace(/([?&]xsec_token=)([^&]+)/, (_m, p1, p2) => p1 + p2.slice(0, 8) + "…");
+        }
+      }
+      // cookie 值预览：前 4 字符 + 总长（如 abcd…(len=44)），
+      // 与 netlogger.js / interceptor.js 格式一致
+      function cookiePreview(value) {
+        const s = String(value);
+        return s.slice(0, 4) + "…(len=" + s.length + ")";
+      }
+
       // ── 1. 读 cookie 快照 ──────────────────────────────────
       const cookieMap = {};
       for (const p of document.cookie.split(";")) {
@@ -225,8 +368,8 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
         has_a1:          "a1" in cookieMap,
         has_web_session: "web_session" in cookieMap,
         has_webId:       "webId" in cookieMap,
-        a1_preview:          cookieMap["a1"]          ? cookieMap["a1"].slice(0, 12)          + "…" : null,
-        web_session_preview: cookieMap["web_session"] ? cookieMap["web_session"].slice(0, 10) + "…" : null,
+        a1_preview:          cookieMap["a1"]          ? cookiePreview(cookieMap["a1"])          : null,
+        web_session_preview: cookieMap["web_session"] ? cookiePreview(cookieMap["web_session"]) : null,
       };
 
       // ── 2. 解析 xsec_token（从原始目标 URL）────────────────
@@ -248,7 +391,9 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
         blockType = "redirect_404";
         httpLike404 = true;
         try {
+          // source 参数记录了原始被拦截 URL（含 xsec_token），先脱敏再进入诊断/事件
           redirectSource = new URL(landedUrl).searchParams.get("source") || null;
+          if (redirectSource) redirectSource = redactMini(redirectSource);
         } catch (_) {}
       }
 
@@ -312,7 +457,7 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
             root_cause: "未登录 / web_session 失效，服务端 302 重定向到 /404",
             cause_category: "session",
             detail:
-              `XHS 服务端检测到请求无有效 session，执行 302 重定向到 /404?source=${redirectSource || targetUrl}。\n` +
+              `XHS 服务端检测到请求无有效 session，执行 302 重定向到 /404?source=${redirectSource || redactMini(targetUrl)}。\n` +
               "web_session cookie 不存在或已过期，xsec_token 随之失效。\n" +
               "解决：重新登录获取新的 web_session。",
             confidence: "high",
@@ -325,7 +470,7 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
             root_cause: "xsec_token 缺失，服务端 302 重定向到 /404",
             cause_category: "token",
             detail:
-              `原始路径 ${redirectSource || targetUrl} 未携带 xsec_token，服务端立即 302 到 /404。\n` +
+              `原始路径 ${redirectSource || redactMini(targetUrl)} 未携带 xsec_token，服务端立即 302 到 /404。\n` +
               "必须从搜索 / 推荐流获取包含 xsec_token 的完整 URL，不能直接构造。",
             confidence: "high",
             how_xhs_decides:
@@ -337,7 +482,7 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
             root_cause: `xsec_token 绑定验证失败，服务端 302 重定向到 /404（来源: ${xsecSource || "未知"}）`,
             cause_category: "token",
             detail:
-              `token 和 session 均存在，但服务端解密 xsec_token 后验证失败，302 到 /404?source=${redirectSource || targetUrl}。\n` +
+              `token 和 session 均存在，但服务端解密 xsec_token 后验证失败，302 到 /404?source=${redirectSource || redactMini(targetUrl)}。\n` +
               "可能原因：\n" +
               "  1. xsec_token 超过有效期（通常数小时）\n" +
               "  2. IP 变化导致 token 中的 ipHash 不匹配\n" +
@@ -428,16 +573,16 @@ async function detectNavigationBlock(tabId, navigatedUrl, finalUrl) {
       return {
         id:             `${Date.now()}_nav`,
         timestamp:      new Date().toISOString(),
-        url:            targetUrl,
-        final_url:      landedUrl || window.location.href,
+        url:            redactMini(targetUrl),
+        final_url:      redactMini(landedUrl || window.location.href),
         redirect_source: redirectSource,
         method:         "GET",
         status:         httpLike404 ? 404 : "200→404",
-        pageUrl:        window.location.href,
+        pageUrl:        redactMini(window.location.href),
         intercept_type: "navigation",
         block_type:     blockType,
         request: {
-          xsec_token:    xsecToken,
+          xsec_token:    xsecToken ? xsecToken.slice(0, 8) + "…" : xsecToken,
           xsec_source:   xsecSource,
           has_xs:        false,   // 导航请求不含 xs header
           has_xt:        false,
@@ -581,7 +726,7 @@ async function cmdNavigate({ url, _retried = false }) {
           u.searchParams.set("xsec_token", freshToken);
           u.searchParams.set("xsec_source", "pc_search");
           const fixedUrl = u.toString();
-          console.log(`[XHS Bridge] 获取新 token 成功，重新导航: ${fixedUrl}`);
+          console.log(`[XHS Bridge] 获取新 token 成功，重新导航: ${redactUrl(fixedUrl)}`);
           return cmdNavigate({ url: fixedUrl, _retried: true });
         }
         console.log("[XHS Bridge] 未能从搜索页获取新 token，内容可能已被删除");
@@ -594,7 +739,7 @@ async function cmdNavigate({ url, _retried = false }) {
     }
 
     const rootCause = event?.diagnosis?.root_cause || "未知原因";
-    throw new Error(`笔记被风控拦截（${rootCause}），重定向至: ${finalUrl}`);
+    throw new Error(`笔记被风控拦截（${rootCause}），重定向至: ${redactUrl(finalUrl)}`);
   }
 
   // ── 页面渲染级 404 检测（HTTP 200 但 SPA 渲染出错误页）──
@@ -671,10 +816,9 @@ async function cmdScreenshot() {
 }
 
 // ───────────────────────── Cookies ─────────────────────────
-
-async function cmdGetCookies({ domain = "xiaohongshu.com" }) {
-  return await chrome.cookies.getAll({ domain });
-}
+// cmdGetCookies 已删除：该命令曾用 chrome.cookies.getAll 返回
+// xiaohongshu.com 全量 cookie 完整值（含 HttpOnly web_session），
+// 经 bridge 可被任意本地进程调用（安全审计 P0）。
 
 // ───────────────────────── MAIN world JS 执行 ─────────────────────────
 
@@ -1271,8 +1415,8 @@ chrome.webRequest.onHeadersReceived.addListener(
       has_a1:              "a1" in cookieMap,
       has_web_session:     "web_session" in cookieMap,
       has_webId:           "webId" in cookieMap,
-      a1_preview:          cookieMap["a1"]          ? cookieMap["a1"].slice(0, 12)          + "…" : null,
-      web_session_preview: cookieMap["web_session"] ? cookieMap["web_session"].slice(0, 10) + "…" : null,
+      a1_preview:          cookieMap["a1"]          ? _cookiePreview(cookieMap["a1"])          : null,
+      web_session_preview: cookieMap["web_session"] ? _cookiePreview(cookieMap["web_session"]) : null,
     };
 
     // ── 收集 302 响应头 ────────────────────────────────────────
@@ -1280,6 +1424,13 @@ chrome.webRequest.onHeadersReceived.addListener(
     for (const h of details.responseHeaders || []) {
       respHeaders[h.name.toLowerCase()] = h.value;
     }
+
+    // set-cookie 只收集 cookie 名（不保留任何 cookie 值，防 web_session 泄漏），
+    // 逗号连接存入 set-cookie-names（与 netlogger.js 规则一致）
+    const setCookieNames = (details.responseHeaders || [])
+      .filter(h => h.name.toLowerCase() === "set-cookie")
+      .map(h => _extractSetCookieName(h.value))
+      .filter(Boolean);
 
     // ── 触发机制判断（基于实测 HTTP 数据） ─────────────────────
     //
@@ -1330,16 +1481,19 @@ chrome.webRequest.onHeadersReceived.addListener(
       const meaning   = ERROR_CODE_MEANING[errorCode] || `未知错误码 ${errorCode}`;
       triggerPrimary  = `xsec_token 验证失败（error_code=${errorCode}）→ ${meaning}`;
       triggerEvidence =
-        `token 前缀=${urlParams.xsec_token.slice(0, 20)}… source=${urlParams.xsec_source || "无"}` +
+        `token 前缀=${urlParams.xsec_token.slice(0, 8)}… source=${urlParams.xsec_source || "无"}` +
         `，error_msg="${errorMsg}"，Sec-Fetch-Site=${secFetchSite || "无"}`;
       causeCategory   = "token";
     } else {
       triggerPrimary  = "xsec_token 内容验证失败 → 服务端解密后字段不匹配，302";
       triggerEvidence =
-        `token 前缀=${urlParams.xsec_token.slice(0, 20)}… source=${urlParams.xsec_source || "无"}` +
+        `token 前缀=${urlParams.xsec_token.slice(0, 8)}… source=${urlParams.xsec_source || "无"}` +
         `，Sec-Fetch-Site=${secFetchSite || "无"}`;
       causeCategory   = "token";
     }
+
+    // url_params 进入事件前对 xsec_token 截断（前 8 字符 + …），evidence 已用原值构造完毕
+    urlParams.xsec_token = redactToken(urlParams.xsec_token);
 
     const event = {
       id:             `${Date.now()}_302webreq`,
@@ -1347,10 +1501,11 @@ chrome.webRequest.onHeadersReceived.addListener(
       intercept_type: "webRequest_302",          // 区分于 fetch/XHR 拦截
 
       // ── 请求上下文（Phase 1 采集）──
-      url:            details.url,
+      // url / redirect_to / referer 均可能内嵌 xsec_token，入库前统一脱敏
+      url:            redactUrl(details.url),
       method:         details.method,
       resource_type:  reqCtx?.type || details.type,
-      redirect_to:    location,
+      redirect_to:    redactUrl(location),
 
       url_params: urlParams,
 
@@ -1359,7 +1514,7 @@ chrome.webRequest.onHeadersReceived.addListener(
         "sec-fetch-site":   secFetchSite,
         "sec-fetch-mode":   reqCtx?.requestHeaders?.["sec-fetch-mode"],
         "sec-fetch-dest":   reqCtx?.requestHeaders?.["sec-fetch-dest"],
-        "referer":          reqCtx?.requestHeaders?.["referer"],
+        "referer":          redactUrl(reqCtx?.requestHeaders?.["referer"]),
         "origin":           reqCtx?.requestHeaders?.["origin"],
         "user-agent":       reqCtx?.requestHeaders?.["user-agent"]?.slice(0, 100),
       },
@@ -1367,11 +1522,13 @@ chrome.webRequest.onHeadersReceived.addListener(
       cookies: cookieAnalysis,
 
       // ── 302 响应头（Phase 2 采集）—— 服务端返回的原始信号 ──
+      // set-cookie 只保留 cookie 名（同 netlogger.js 规则），不保留任何 cookie 值；
+      // location 内嵌原始 URL 时同样脱敏
       response_302_headers: {
-        location:           respHeaders["location"],
+        location:           redactUrl(respHeaders["location"]),
         "cache-control":    respHeaders["cache-control"],
         "x-request-id":     respHeaders["x-request-id"],
-        "set-cookie":       respHeaders["set-cookie"],
+        "set-cookie-names": setCookieNames.join(","),
         server:             respHeaders["server"],
       },
 
@@ -1400,7 +1557,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     chrome.runtime.sendMessage({ type: "BLOCK_EVENT_ADDED", event }).catch(() => {});
     console.log(
       `[XHS 302观测] ${triggerPrimary}\n` +
-      `  URL: ${details.url.slice(0, 100)}\n` +
+      `  URL: ${redactUrl(details.url).slice(0, 100)}\n` +
       `  Sec-Fetch-Site: ${secFetchSite || "无"} | xsec_token: ${urlParams.xsec_token ? "有" : "无"}`,
     );
   },
@@ -1450,6 +1607,20 @@ async function cmdAnalyzeRiskControl({ probeUrls = [] } = {}) {
  * 必须完全自包含，不可引用任何外部变量。
  */
 async function riskControlAnalyzer(extraProbeUrls) {
+  // 自包含 URL 脱敏（MAIN world 不可引用 SW 侧 redactUrl）：
+  // query 中 xsec_token 值替换为「前 8 字符 + …」，与 netlogger.js 规则一致
+  function redactMini(url) {
+    if (typeof url !== "string" || !url.includes("xsec_token=")) return url;
+    try {
+      const u = new URL(url, location.origin);
+      const t = u.searchParams.get("xsec_token");
+      if (t) u.searchParams.set("xsec_token", t.slice(0, 8) + "…");
+      return u.toString();
+    } catch (_) {
+      return url.replace(/([?&]xsec_token=)([^&]+)/, (_m, p1, p2) => p1 + p2.slice(0, 8) + "…");
+    }
+  }
+
   const report = {
     timestamp: new Date().toISOString(),
     fingerprints: {},
@@ -1505,7 +1676,7 @@ async function riskControlAnalyzer(extraProbeUrls) {
   // ── 2. 页面状态 / XHS 专项检测 ───────────────────────────────
   const ps = report.page_state;
 
-  ps.current_url = window.location.href;
+  ps.current_url = redactMini(window.location.href);
   ps.page_title  = document.title;
 
   try {
@@ -1540,7 +1711,7 @@ async function riskControlAnalyzer(extraProbeUrls) {
     if (r.name.includes("xiaohongshu.com") && r.name.includes("/api/")) {
       const s = r.responseStatus;
       if (s && (s === 404 || s === 461 || s === 403 || s === 999)) {
-        resFailed.push({ url: r.name, status: s });
+        resFailed.push({ url: redactMini(r.name), status: s });
       }
     }
   }

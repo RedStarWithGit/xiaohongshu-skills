@@ -3,6 +3,9 @@
 Extension 连接到这里（WebSocket），CLI 命令通过同一端口发送（role=cli），
 Bridge 将命令路由给 Extension 并把结果返回给 CLI。
 
+所有连接的首条消息必须携带 auth 字段（值 ~/.xhs/bridge_secret 的内容），
+认证通过后才处理命令或登记为 extension。
+
 启动方式：
     python scripts/bridge_server.py
 
@@ -13,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import sys
@@ -21,19 +25,21 @@ from typing import Any
 
 import websockets
 from websockets.server import ServerConnection
+from xhs.bridge_auth import AUTH_ERROR_MESSAGE, get_bridge_secret
 
 logger = logging.getLogger("xhs-bridge")
 
 
 class BridgeServer:
-    def __init__(self) -> None:
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
         self._extension_ws: ServerConnection | None = None
         self._pending: dict[str, asyncio.Future[Any]] = {}
 
     async def handle(self, ws: ServerConnection) -> None:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
-        except (asyncio.TimeoutError, Exception) as e:
+        except (TimeoutError, Exception) as e:
             logger.warning("握手超时或失败: %s", e)
             return
 
@@ -42,13 +48,37 @@ class BridgeServer:
         except json.JSONDecodeError:
             return
 
+        # 先校验 auth，认证通过前不处理 method、不登记为 extension
+        auth = msg.get("auth")
+        if not isinstance(auth, str) or not hmac.compare_digest(
+            auth.encode("utf-8"), self._secret.encode("utf-8")
+        ):
+            logger.warning("连接认证失败，已拒绝")
+            await self._reject(ws, AUTH_ERROR_MESSAGE)
+            return
+
         role = msg.get("role")
         if role == "extension":
+            # 防抢占：已有活跃 extension 时拒绝新连接（旧连接断开后可接入）
+            if self._extension_ws is not None:
+                logger.warning("已有扩展连接，拒绝新的 extension 接入")
+                await self._reject(ws, "已有扩展连接，拒绝抢占")
+                return
             await self._handle_extension(ws)
         elif role == "cli":
             await self._handle_cli(ws, msg)
         else:
             logger.warning("未知 role: %s", role)
+
+    async def _reject(self, ws: ServerConnection, message: str) -> None:
+        """发送 auth_error 后关闭连接。"""
+        try:
+            await ws.send(
+                json.dumps({"type": "auth_error", "message": message}, ensure_ascii=False)
+            )
+            await ws.close()
+        except Exception as e:
+            logger.debug("发送 auth_error 失败: %s", e)
 
     # ─── Extension 端（长连接） ───────────────────────────────────────
 
@@ -80,13 +110,15 @@ class BridgeServer:
     async def _handle_cli(self, ws: ServerConnection, msg: dict) -> None:
         # 特殊命令：查询 server/extension 状态，无需转发
         if msg.get("method") == "ping_server":
-            await ws.send(json.dumps({
-                "result": {"extension_connected": self._extension_ws is not None}
-            }))
+            await ws.send(
+                json.dumps({"result": {"extension_connected": self._extension_ws is not None}})
+            )
             return
 
         if not self._extension_ws:
-            await ws.send(json.dumps({"error": "Extension 未连接，请确认浏览器已安装并启用 XHS Bridge 扩展"}))
+            await ws.send(
+                json.dumps({"error": "Extension 未连接，请确认浏览器已安装并启用 XHS Bridge 扩展"})
+            )
             return
 
         msg_id = str(uuid.uuid4())
@@ -101,7 +133,7 @@ class BridgeServer:
         try:
             result = await asyncio.wait_for(future, timeout=90.0)
             await ws.send(json.dumps(result))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(msg_id, None)
             await ws.send(json.dumps({"error": "命令执行超时（90s）"}))
         except ConnectionError as e:
@@ -109,9 +141,15 @@ class BridgeServer:
 
 
 async def main(port: int) -> None:
-    server = BridgeServer()
+    secret = get_bridge_secret()
+    if not secret:
+        # 防御校验：空 secret 会让 hmac.compare_digest(b"", b"") 放行任意空 auth
+        logger.error("bridge secret 为空，请删除 ~/.xhs/bridge_secret 后重试")
+        sys.exit(1)
+    server = BridgeServer(secret)
     async with websockets.serve(server.handle, "localhost", port):
         logger.info("Bridge server 已启动: ws://localhost:%d", port)
+        logger.info("鉴权已启用（secret 文件: ~/.xhs/bridge_secret）")
         logger.info("等待浏览器扩展连接...")
         await asyncio.Future()  # 永久运行
 

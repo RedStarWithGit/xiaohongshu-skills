@@ -1,9 +1,34 @@
-function renderStatus(wsConnected) {
+const BRIDGE_STATE_LABEL = {
+  connected: "已连接",
+  disconnected: "未连接",
+  auth_failed: "认证失败",
+  unconfigured: "未配置",
+};
+
+function renderStatus(wsConnected, bridgeState) {
   set("bridge-status", "bridge-dot", "bridge-text", wsConnected, wsConnected ? "已连接" : "未连接");
   set("ext-status",   "ext-dot",   "ext-text",   true, "运行中");
-  document.getElementById("hint").textContent = wsConnected
-    ? "一切正常，可以运行 Python 脚本。"
-    : "请先运行：python scripts/cli.py <命令>";
+  renderPairState(bridgeState);
+  const hint = document.getElementById("hint");
+  if (bridgeState === "unconfigured") {
+    hint.textContent = "未配置密钥：请在下方 Bridge 配对区粘贴 ~/.xhs/bridge_secret 内容。";
+  } else if (bridgeState === "auth_failed") {
+    hint.textContent = "认证失败：密钥与 ~/.xhs/bridge_secret 不一致，请重新配置。";
+  } else if (wsConnected) {
+    hint.textContent = "一切正常，可以运行 Python 脚本。";
+  } else {
+    hint.textContent = "请先运行：python scripts/cli.py <命令>";
+  }
+}
+
+function renderPairState(bridgeState) {
+  const loading = !bridgeState;
+  const ok = bridgeState === "connected";
+  const cls = loading ? "loading" : ok ? "ok" : "err";
+  document.getElementById("pair-status").className = `badge ${cls}`;
+  document.getElementById("pair-dot").className = `dot ${cls}`;
+  document.getElementById("pair-text").textContent =
+    loading ? "检测中..." : (BRIDGE_STATE_LABEL[bridgeState] || "未连接");
 }
 
 function set(badgeId, dotId, textId, ok, label) {
@@ -20,7 +45,7 @@ try {
       renderStatus(false);
       return;
     }
-    renderStatus(resp.status.wsConnected);
+    renderStatus(resp.status.wsConnected, resp.status.bridgeState);
   });
 } catch (e) {
   renderStatus(false);
@@ -29,9 +54,64 @@ try {
 // 实时监听状态变化（background 主动推送）
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "STATUS_CHANGED") {
-    renderStatus(msg.status.wsConnected);
+    renderStatus(msg.status.wsConnected, msg.status.bridgeState);
   }
 });
+
+// ─── Bridge 配对（bridgeSecret 管理） ────────────────────────────
+
+const SECRET_STATE_KEY = "bridgeSecret";
+
+function renderSecretState(secret) {
+  const el = document.getElementById("secret-state");
+  if (!secret) {
+    el.textContent = "未配置";
+    el.style.color = "#c5221f";
+  } else {
+    // 只展示前 4 字符，不泄漏完整密钥
+    el.textContent = `已配置（${secret.slice(0, 4)}…）`;
+    el.style.color = "#1e8e3e";
+  }
+}
+
+function refreshSecretState() {
+  chrome.storage.local.get([SECRET_STATE_KEY], (data) => {
+    renderSecretState(data[SECRET_STATE_KEY] || "");
+  });
+}
+
+// 通知 background 重置退避并按新密钥立即重连（或停止连接）
+function notifySecretChanged() {
+  try {
+    chrome.runtime.sendMessage({ type: "BRIDGE_SECRET_CHANGED" }).catch(() => {});
+  } catch (_) {}
+}
+
+document.getElementById("secret-save").addEventListener("click", () => {
+  const input = document.getElementById("secret-input");
+  const value = (input.value || "").trim();
+  if (!value) {
+    input.placeholder = "密钥不能为空，请粘贴 ~/.xhs/bridge_secret 内容";
+    return;
+  }
+  chrome.storage.local.set({ [SECRET_STATE_KEY]: value }, () => {
+    // 不回显完整密钥
+    input.value = "";
+    input.placeholder = "粘贴 ~/.xhs/bridge_secret 文件内容";
+    refreshSecretState();
+    notifySecretChanged();
+  });
+});
+
+document.getElementById("secret-clear").addEventListener("click", () => {
+  chrome.storage.local.remove(SECRET_STATE_KEY, () => {
+    refreshSecretState();
+    notifySecretChanged();
+    renderStatus(false, "unconfigured");
+  });
+});
+
+refreshSecretState();
 
 // ── 风控扫描 ──────────────────────────────────────────────────
 
@@ -66,7 +146,7 @@ function renderRiskReport(report) {
   badge.className = `risk-badge risk-${level}`;
 
   const list = document.getElementById("issue-list");
-  list.innerHTML = "";
+  list.replaceChildren();
   if (!report.issues || report.issues.length === 0) {
     const li = document.createElement("li");
     li.textContent = "✓ 未发现风控特征";
@@ -90,7 +170,10 @@ function showRiskError(msg) {
   badge.textContent = "错误";
   badge.className = "risk-badge risk-medium";
   const list = document.getElementById("issue-list");
-  list.innerHTML = `<li style="color:#c5221f">${msg}</li>`;
+  const li = document.createElement("li");
+  li.textContent = msg;
+  li.style.color = "#c5221f";
+  list.replaceChildren(li);
   document.getElementById("risk-result").style.display = "block";
 }
 
@@ -113,7 +196,10 @@ function renderEvents(events) {
   const count  = document.getElementById("intercept-count");
 
   if (events.length === 0) {
-    el.innerHTML = '<span style="color:#aaa">暂无拦截记录</span>';
+    const empty = document.createElement("span");
+    empty.style.color = "#aaa";
+    empty.textContent = "暂无拦截记录";
+    el.replaceChildren(empty);
     badge.className = "badge loading";
     dot.className   = "dot loading";
     count.textContent = "监听中";
@@ -124,17 +210,35 @@ function renderEvents(events) {
   dot.className   = "dot err";
   count.textContent = `${events.length} 条`;
 
-  el.innerHTML = events.slice(0, 10).map(ev => {
+  // 外部数据（url / root_cause / intercept_type / 时间）一律走 textContent，防 HTML 注入
+  el.replaceChildren(...events.slice(0, 10).map(ev => {
     const color = CAUSE_COLORS[ev.diagnosis?.cause_category] || "#555";
     const time  = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString("zh-CN") : "";
-    const urlShort = ev.url.replace(/https?:\/\/[^/]+/, "").slice(0, 45);
-    return `
-      <div style="border-left:3px solid ${color};padding:3px 6px;margin-bottom:4px;background:#fafafa;border-radius:0 4px 4px 0">
-        <div style="color:${color};font-weight:600">[${ev.status}] ${ev.diagnosis?.root_cause || "未知"}</div>
-        <div style="color:#666;font-size:9.5px">${urlShort}</div>
-        <div style="color:#999;font-size:9px">${time} · ${ev.intercept_type || "fetch"}</div>
-      </div>`;
-  }).join("");
+    const urlShort = String(ev.url || "").replace(/https?:\/\/[^/]+/, "").slice(0, 45);
+
+    const box = document.createElement("div");
+    box.style.cssText =
+      `border-left:3px solid ${color};padding:3px 6px;margin-bottom:4px;` +
+      "background:#fafafa;border-radius:0 4px 4px 0";
+
+    const line1 = document.createElement("div");
+    line1.style.color = color;
+    line1.style.fontWeight = "600";
+    line1.textContent = `[${ev.status}] ${ev.diagnosis?.root_cause || "未知"}`;
+
+    const line2 = document.createElement("div");
+    line2.style.color = "#666";
+    line2.style.fontSize = "9.5px";
+    line2.textContent = urlShort;
+
+    const line3 = document.createElement("div");
+    line3.style.color = "#999";
+    line3.style.fontSize = "9px";
+    line3.textContent = `${time} · ${ev.intercept_type || "fetch"}`;
+
+    box.append(line1, line2, line3);
+    return box;
+  }));
 }
 
 // 初始加载历史事件
@@ -249,15 +353,20 @@ const NETLOG_CAT_LABEL = {
 function renderNetlogStream(container) {
   // 最新在底，倒序展示前 200 条
   const slice = _netlogEntries.slice(-200);
-  container.innerHTML = slice.map((e, i) => {
+  // 外部数据（tsLabel/method/status/host/path/category）一律走 textContent，防 HTML 注入
+  container.replaceChildren(...slice.map((e, i) => {
     const star = (e.category === "fingerprint_upload" || e.category === "risk_redirect" ||
                   e.category === "signature_failure") ? " ★" : "";
     const path = e.path.length > 50 ? e.path.slice(0, 47) + "…" : e.path;
     const host = e.host.replace(/^www\./, "");
-    return `<div class="netlog-row cat-${e.category}" data-idx="${i}">
-      ${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ${e.duration_ms}ms  ${host}${path}  [${NETLOG_CAT_LABEL[e.category]}]${star}
-    </div>`;
-  }).join("");
+    const row = document.createElement("div");
+    row.className = `netlog-row cat-${e.category}`;
+    row.dataset.idx = String(i);
+    row.textContent =
+      `${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ${e.duration_ms}ms  ` +
+      `${host}${path}  [${NETLOG_CAT_LABEL[e.category]}]${star}`;
+    return row;
+  }));
 
   // 点击展开详情
   container.querySelectorAll(".netlog-row").forEach(row => {
@@ -289,28 +398,47 @@ function renderNetlogCategory(container) {
   const order = ["fingerprint_upload", "signature_failure", "risk_redirect",
                  "business_error", "cookie_change", "business_api", "page_nav", "other"];
 
-  const sections = [];
+  // 外部数据（tsLabel/method/status/host/path/signals）一律走 textContent，防 HTML 注入
+  const frag = document.createDocumentFragment();
   for (const cat of order) {
     if (!groups[cat] || groups[cat].length === 0) continue;
     const label = NETLOG_CAT_LABEL[cat];
     const items = groups[cat].slice(-50);  // 每类最多展示 50 条
-    sections.push(`
-      <details open style="margin-bottom:6px">
-        <summary style="cursor:pointer;font-size:11px;font-weight:600;color:#444">▾ ${label} (${groups[cat].length})</summary>
-        ${items.map((e, i) => {
-          const path = e.path.length > 60 ? e.path.slice(0, 57) + "…" : e.path;
-          const signal = (e.signals || []).slice(0, 2).join(", ");
-          const signalSuffix = signal ? "  [" + signal + "]" : "";
-          const hostShort = e.host.replace(/^www\./, "");
-          return `<div class="netlog-row cat-${e.category}" data-cat="${cat}" data-idx="${i}">` +
-                 `${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ` +
-                 `${hostShort}${path}${signalSuffix}</div>`;
-        }).join("")}
-      </details>
-    `);
+
+    const details = document.createElement("details");
+    details.open = true;
+    details.style.marginBottom = "6px";
+
+    const summary = document.createElement("summary");
+    summary.style.cssText = "cursor:pointer;font-size:11px;font-weight:600;color:#444";
+    summary.textContent = `▾ ${label} (${groups[cat].length})`;
+    details.appendChild(summary);
+
+    items.forEach((e, i) => {
+      const path = e.path.length > 60 ? e.path.slice(0, 57) + "…" : e.path;
+      const signal = (e.signals || []).slice(0, 2).join(", ");
+      const signalSuffix = signal ? "  [" + signal + "]" : "";
+      const hostShort = e.host.replace(/^www\./, "");
+      const row = document.createElement("div");
+      row.className = `netlog-row cat-${e.category}`;
+      row.dataset.cat = cat;
+      row.dataset.idx = String(i);
+      row.textContent =
+        `${e.tsLabel}  ${e.method.padEnd(4)} ${e.status || "?"}  ` +
+        `${hostShort}${path}${signalSuffix}`;
+      details.appendChild(row);
+    });
+
+    frag.appendChild(details);
   }
 
-  container.innerHTML = sections.join("") || '<div style="color:#aaa;font-size:11px;padding:8px">暂无数据</div>';
+  if (!frag.hasChildNodes()) {
+    const empty = document.createElement("div");
+    empty.style.cssText = "color:#aaa;font-size:11px;padding:8px";
+    empty.textContent = "暂无数据";
+    frag.appendChild(empty);
+  }
+  container.replaceChildren(frag);
 
   // 详情点击：data-cat + data-idx 反查
   container.querySelectorAll(".netlog-row").forEach(row => {

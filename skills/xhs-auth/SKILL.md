@@ -39,7 +39,7 @@ metadata:
 | `wait-login` | 等待扫码完成（阻塞） |
 | `send-code --phone` | 发送手机验证码 |
 | `verify-code --code` | 提交验证码完成登录 |
-| `delete-cookies` | 退出登录并清除 cookies |
+| `delete-cookies` | 退出登录（页面 UI 操作，不删除本地 cookies 文件） |
 
 ---
 
@@ -74,25 +74,23 @@ python scripts/cli.py check-login
 
 #### 方式 A：二维码登录（所有平台通用）
 
-> `check-login` 未登录时会自动返回二维码（`qrcode_image_url` + `qrcode_path`），无需单独调 `get-qrcode`。
+> `check-login` 未登录时会自动返回二维码（`qrcode_image_url` 为本地 PNG 绝对路径，与 `qrcode_path` 相同），无需单独调 `get-qrcode`。
 
-**第一步** — 从 `check-login` 返回的 JSON 取 `qrcode_image_url`，在回复中展示：
+**第一步** — 展示登录二维码，按以下规范：
 
 ```
 请使用小红书 App 扫描以下二维码登录：
 
-![小红书登录二维码]({qrcode_image_url})
-
-您也可以在手机浏览器中直接访问此链接完成登录：
 {qr_login_url}
+
+（终端已渲染 ASCII 二维码，二维码 PNG 也已在本地打开，可直接用手机扫码）
 ```
 
 > **展示规范（必须全部遵守）**：
-> 1. 展示二维码图片（`qrcode_image_url`）。
+> 1. 二维码已在终端渲染为 ASCII 图形，本地 PNG 已自动打开，提示用户直接扫码即可。
 > 2. 如果输出含 `qr_login_url`，**必须**同时展示该链接并提示用户"也可以在手机浏览器中直接访问此链接完成登录"。
-> 3. **禁止**省略 `qr_login_url`，即使已展示了二维码图片。
-
-图片内嵌在对话窗口，用户可以扫码或直接访问链接登录。
+> 3. **禁止**省略 `qr_login_url`，即使终端/本地 PNG 已展示二维码。
+> 4. `qrcode_image_url` 现在是本地 PNG 文件路径（二维码数据不出本机），**不要**再作为 markdown 图片嵌入回复。
 
 **第二步** — 等待登录完成（**单次调用，无需轮询**）：
 
@@ -136,7 +134,7 @@ python scripts/cli.py verify-code --code <用户提供的6位验证码>
 
 ### 清除 Cookies（退出登录）
 
-> `delete-cookies` 命令内部自动完成两步：先通过页面 UI 点击「更多」→「退出登录」，再删除本地 cookies 文件。只需执行一条命令即可。
+> `delete-cookies` 仅通过页面 UI 点击「更多」→「退出登录」完成登出；登录态保存在用户浏览器中，本命令**不会删除本地 cookies 文件**。只需执行一条命令即可。
 
 ```bash
 python scripts/cli.py delete-cookies

@@ -76,18 +76,82 @@ const NETLOG_RESP_HEADER_WHITELIST = new Set([
   "content-type", "server", "x-application-context",
 ]);
 
+// 签名类请求头：值截断后入 entry（保留前 8 字符 + 总长，不泄漏完整签名）
+const NETLOG_SIGNATURE_HEADERS = new Set(["xs", "xt", "x-s-common", "x-t"]);
+
 const NETLOG_SKIP_TYPES = new Set(["image", "font", "stylesheet", "media"]);
+
+/**
+ * URL 脱敏：query 中 xsec_token 值替换为「前 8 字符 + …」。
+ * 供 netlogger / background 共享（background.js 经 importScripts 引入本文件）。
+ */
+function redactUrl(url) {
+  if (typeof url !== "string" || !url.includes("xsec_token=")) return url;
+  try {
+    const u = new URL(url);
+    const t = u.searchParams.get("xsec_token");
+    if (t) u.searchParams.set("xsec_token", t.slice(0, 8) + "…");
+    return u.toString();
+  } catch (_) {
+    // 相对路径等无法 new URL 的场景，退化为正则替换
+    return url.replace(/([?&]xsec_token=)([^&]+)/, (_m, p1, p2) => p1 + p2.slice(0, 8) + "…");
+  }
+}
+
+/**
+ * xsec_token 等令牌值截断：前 8 字符 + …
+ */
+function redactToken(value) {
+  if (typeof value !== "string" || !value) return value;
+  return value.slice(0, 8) + "…";
+}
+
+/**
+ * 从单条 Set-Cookie 值中提取 cookie 名（第一分号切分 → 第一个等号切分取名）。
+ * 不保留任何 cookie 值。
+ */
+function _extractSetCookieName(setCookieValue) {
+  const first = String(setCookieValue).split(";")[0];
+  const i = first.indexOf("=");
+  return i > 0 ? first.slice(0, i).trim() : "";
+}
+
+function _truncateSignature(value) {
+  const s = String(value);
+  return s.slice(0, 8) + "…(len=" + s.length + ")";
+}
+
+/**
+ * cookie 值预览：前 4 字符 + 总长（如 abcd…(len=44)）。
+ * 与 interceptor.js / background.js 中的同名逻辑保持格式一致。
+ */
+function _cookiePreview(value) {
+  const s = String(value);
+  return s.slice(0, 4) + "…(len=" + s.length + ")";
+}
 
 function _filterHeaders(rawHeaders, whitelist) {
   const out = {};
   if (!rawHeaders) return out;
   for (const h of rawHeaders) {
     const k = h.name.toLowerCase();
-    if (whitelist.has(k)) {
-      // set-cookie 可能多个值，累加
-      if (k === "set-cookie" && out[k]) out[k] += "\n" + h.value;
-      else out[k] = h.value;
+    if (!whitelist.has(k)) continue;
+    // set-cookie：只收集 cookie 名，聚合为逗号连接的字符串，
+    // 存入 set-cookie-names（entry 中不出现任何 cookie 值，防 web_session 泄漏）
+    if (k === "set-cookie") {
+      const name = _extractSetCookieName(h.value);
+      if (!name) continue;
+      out["set-cookie-names"] = out["set-cookie-names"]
+        ? out["set-cookie-names"] + "," + name
+        : name;
+      continue;
     }
+    // 签名类请求头：截断后再入 entry
+    if (NETLOG_SIGNATURE_HEADERS.has(k)) {
+      out[k] = _truncateSignature(h.value);
+      continue;
+    }
+    out[k] = h.value;
   }
   return out;
 }
@@ -148,9 +212,9 @@ chrome.webRequest.onBeforeRequest.addListener(
       ts: details.timeStamp,
       tsLabel: _tsLabel(details.timeStamp),
       method: details.method,
-      url: details.url,
+      url: redactUrl(details.url),
       host,
-      path: (() => { try { const u = new URL(details.url); return u.pathname + (u.search || ""); } catch (_) { return details.url; } })(),
+      path: redactUrl((() => { try { const u = new URL(details.url); return u.pathname + (u.search || ""); } catch (_) { return details.url; } })()),
       resourceType: details.type,
       tabId: details.tabId,
       reqHeaders: {},
@@ -194,7 +258,7 @@ chrome.webRequest.onSendHeaders.addListener(
       has_xsCommon:  !!entry.reqHeaders["x-s-common"],
       sec_fetch_site: entry.reqHeaders["sec-fetch-site"] || null,
       sec_fetch_mode: entry.reqHeaders["sec-fetch-mode"] || null,
-      referer:        entry.reqHeaders["referer"] || null,
+      referer:        redactUrl(entry.reqHeaders["referer"] || null),
       origin:         entry.reqHeaders["origin"] || null,
       ua_prefix:      ua.slice(0, 80),
       cookie: {
@@ -202,8 +266,8 @@ chrome.webRequest.onSendHeaders.addListener(
         has_web_session:     "web_session" in cookieMap,
         has_webId:           "webId" in cookieMap,
         has_gid:             "gid" in cookieMap,
-        a1_preview:          cookieMap["a1"]          ? cookieMap["a1"].slice(0, 12)          + "…" : null,
-        web_session_preview: cookieMap["web_session"] ? cookieMap["web_session"].slice(0, 10) + "…" : null,
+        a1_preview:          cookieMap["a1"]          ? _cookiePreview(cookieMap["a1"])          : null,
+        web_session_preview: cookieMap["web_session"] ? _cookiePreview(cookieMap["web_session"]) : null,
       },
     };
   },
@@ -223,17 +287,17 @@ chrome.webRequest.onHeadersReceived.addListener(
     entry.statusLine = (details.statusLine || "").replace(/^HTTP\/[\d.]+\s*/, "");
     entry.respHeaders = _filterHeaders(details.responseHeaders, NETLOG_RESP_HEADER_WHITELIST);
 
-    if (entry.respHeaders["set-cookie"]) {
-      entry.setCookie = entry.respHeaders["set-cookie"]
-        .split("\n")
-        .map(s => {
-          const i = s.indexOf("=");
-          return i > 0 ? s.slice(0, i).trim() : s.trim();
-        });
+    if (entry.respHeaders["set-cookie-names"]) {
+      // respHeaders 中只有 cookie 名（逗号连接），setCookie 保持为名字数组
+      entry.setCookie = entry.respHeaders["set-cookie-names"]
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean);
     }
 
     if (details.statusCode === 301 || details.statusCode === 302) {
-      entry.redirectTo = entry.respHeaders["location"] || null;
+      // Location 头可能内嵌含 xsec_token 的原始 URL（/404?source=...），脱敏后存储
+      entry.redirectTo = redactUrl(entry.respHeaders["location"] || null);
       if (entry.redirectTo) {
         try {
           const loc = new URL(entry.redirectTo, details.url);
@@ -293,6 +357,10 @@ const NETLOG_INTERCEPTOR_WINDOW_MS = 2000;
 function netlogIngestInterceptor(payload) {
   if (!_netEnabled || !payload) return;
 
+  // URL 脱敏（xsec_token）：与 webRequest 侧 entry.url 的脱敏规则一致，
+  // 保证 _netlogUrlMatch 两侧可比
+  payload.url = redactUrl(payload.url);
+
   // 在最近 2s 内倒序找匹配 (method + url)，给该 entry 填响应体
   for (let i = _netBuffer.length - 1; i >= 0; i--) {
     const e = _netBuffer[i];
@@ -318,7 +386,7 @@ function netlogIngestInterceptor(payload) {
     method: payload.method === "?" ? "UNKNOWN" : payload.method,
     url: payload.url,
     host: (() => { try { return new URL(payload.url).host; } catch (_) { return ""; } })(),
-    path: (() => { try { const u = new URL(payload.url); return u.pathname + (u.search || ""); } catch (_) { return payload.url; } })(),
+    path: redactUrl((() => { try { const u = new URL(payload.url); return u.pathname + (u.search || ""); } catch (_) { return payload.url; } })()),
     resourceType: "xmlhttprequest",
     tabId: -1,
     reqHeaders: {},

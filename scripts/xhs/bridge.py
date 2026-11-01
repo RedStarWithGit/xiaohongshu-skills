@@ -15,8 +15,10 @@ import os
 from typing import Any
 
 import websockets.sync.client as ws_client
+from websockets.exceptions import WebSocketException
 
-from .errors import CDPError, ElementNotFoundError
+from .bridge_auth import AUTH_ERROR_MESSAGE, get_bridge_secret
+from .errors import BridgeAuthError, CDPError, ElementNotFoundError
 
 BRIDGE_URL = "ws://localhost:9333"
 
@@ -29,20 +31,37 @@ class BridgePage:
 
     # ─── 内部通信 ───────────────────────────────────────────────
 
-    def _call(self, method: str, params: dict | None = None) -> Any:
-        """向 bridge server 发送一条命令并等待结果。"""
-        msg: dict[str, Any] = {"role": "cli", "method": method}
+    def _first_message(self, method: str, params: dict | None = None) -> dict[str, Any]:
+        """构造首条消息（携带 bridge 鉴权 secret）。"""
+        msg: dict[str, Any] = {
+            "role": "cli",
+            "auth": get_bridge_secret(),
+            "method": method,
+        }
         if params:
             msg["params"] = params
+        return msg
+
+    @staticmethod
+    def _raise_if_auth_error(resp: dict) -> None:
+        """server 返回 auth_error 时抛出 BridgeAuthError。"""
+        if resp.get("type") == "auth_error":
+            raise BridgeAuthError(str(resp.get("message") or AUTH_ERROR_MESSAGE))
+
+    def _call(self, method: str, params: dict | None = None) -> Any:
+        """向 bridge server 发送一条命令并等待结果。"""
+        msg = self._first_message(method, params)
         try:
             with ws_client.connect(self._bridge_url, max_size=50 * 1024 * 1024) as ws:
                 ws.send(json.dumps(msg, ensure_ascii=False))
                 raw = ws.recv(timeout=90)
-        except OSError as e:
-            raise CDPError(f"无法连接到 bridge server（ws://localhost:9333）: {e}") from e
+        except (OSError, WebSocketException) as e:
+            # ConnectionClosed/TimeoutError 等继承 WebSocketException 而非 OSError，需一并捕获
+            raise CDPError(f"与 bridge server 通信中断: {e}") from e
 
         resp = json.loads(raw)
-        if "error" in resp and resp["error"]:
+        self._raise_if_auth_error(resp)
+        if resp.get("error"):
             raise CDPError(f"Bridge 错误: {resp['error']}")
         return resp.get("result")
 
@@ -268,27 +287,36 @@ class BridgePage:
 
     # ─── 兼容性辅助方法 ──────────────────────────────────────────
 
+    def _ping_server(self) -> dict:
+        """向 bridge server 发送 ping_server 并返回原始响应。"""
+        try:
+            with ws_client.connect(self._bridge_url, open_timeout=3) as ws:
+                ws.send(json.dumps(self._first_message("ping_server")))
+                raw = ws.recv(timeout=5)
+        except (OSError, WebSocketException) as e:
+            raise CDPError(f"与 bridge server 通信中断: {e}") from e
+        resp = json.loads(raw)
+        self._raise_if_auth_error(resp)
+        return resp
+
     def is_server_running(self) -> bool:
         """检查 bridge server 是否在运行（不需要 extension 已连接）。"""
         try:
-            with ws_client.connect(self._bridge_url, open_timeout=3) as ws:
-                ws.send(json.dumps({"role": "cli", "method": "ping_server"}))
-                raw = ws.recv(timeout=5)
-            resp = json.loads(raw)
-            return "result" in resp
+            return "result" in self._ping_server()
+        except BridgeAuthError:
+            raise
         except Exception:
             return False
 
     def is_extension_connected(self) -> bool:
         """检查浏览器扩展是否已连接到 bridge server。"""
         try:
-            with ws_client.connect(self._bridge_url, open_timeout=3) as ws:
-                ws.send(json.dumps({"role": "cli", "method": "ping_server"}))
-                raw = ws.recv(timeout=5)
-            resp = json.loads(raw)
-            return bool(resp.get("result", {}).get("extension_connected"))
+            resp = self._ping_server()
+        except BridgeAuthError:
+            raise
         except Exception:
             return False
+        return bool(resp.get("result", {}).get("extension_connected"))
 
     @property
     def target_id(self) -> str:

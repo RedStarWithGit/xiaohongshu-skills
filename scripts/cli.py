@@ -53,6 +53,24 @@ def _open_file_if_display(path: str) -> None:
         logger.debug("无法自动打开文件: %s", path)
 
 
+def _render_qr_in_terminal(login_url: str | None) -> None:
+    """在终端渲染 ASCII 二维码（本地生成，二维码数据不出本机）。
+
+    输出到 stderr，保持 stdout 仅含 JSON，便于脚本解析。
+    """
+    if not login_url:
+        return
+    try:
+        import qrcode
+
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(login_url)
+        qr.make(fit=True)
+        qr.print_ascii(out=sys.stderr, invert=True)
+    except Exception:
+        logger.debug("终端渲染 ASCII 二维码失败")
+
+
 # ─── Bridge 连接 ──────────────────────────────────────────────────────────────
 
 
@@ -153,7 +171,12 @@ _connect_existing = _connect
 
 def _qrcode_fallback(browser, page, args: argparse.Namespace) -> None:
     """频率限制时刷新页面返回二维码。"""
-    from xhs.login import fetch_qrcode, make_qrcode_url, save_qrcode_to_file
+    from xhs.login import (
+        cleanup_qrcode_file,
+        decode_qr_login_url,
+        fetch_qrcode,
+        save_qrcode_to_file,
+    )
     from xhs.urls import EXPLORE_URL
 
     page.navigate(EXPLORE_URL)
@@ -161,19 +184,24 @@ def _qrcode_fallback(browser, page, args: argparse.Namespace) -> None:
 
     png_bytes, _b64_orig, already = fetch_qrcode(page)
     if already:
+        cleanup_qrcode_file()
         _output({"logged_in": True, "message": "已登录"})
         return
 
     qrcode_path = save_qrcode_to_file(png_bytes)
-    image_url, login_url = make_qrcode_url(png_bytes)
+    login_url = decode_qr_login_url(png_bytes)
     _open_file_if_display(qrcode_path)
+    _render_qr_in_terminal(login_url)
 
     result: dict = {
         "logged_in": False,
         "login_method": "qrcode",
         "qrcode_path": qrcode_path,
-        "qrcode_image_url": image_url,
-        "message": "验证码发送受限，已切换为二维码登录，请扫码。扫码后运行 wait-login 等待登录结果。",
+        "qrcode_image_url": qrcode_path,
+        "message": (
+            "验证码发送受限，已切换为二维码登录。终端已渲染 ASCII 二维码，"
+            "本地 PNG 已打开，请扫码。扫码后运行 wait-login 等待登录结果。"
+        ),
     }
     if login_url:
         result["qr_login_url"] = login_url
@@ -182,25 +210,35 @@ def _qrcode_fallback(browser, page, args: argparse.Namespace) -> None:
 
 def cmd_check_login(args: argparse.Namespace) -> None:
     """检查登录状态，未登录时自动获取二维码。"""
-    from xhs.login import fetch_qrcode, make_qrcode_url, save_qrcode_to_file
+    from xhs.login import (
+        cleanup_qrcode_file,
+        decode_qr_login_url,
+        fetch_qrcode,
+        save_qrcode_to_file,
+    )
 
     browser, page = _connect(args)
     try:
         png_bytes, _b64_orig, already = fetch_qrcode(page)
         if already:
+            cleanup_qrcode_file()
             _output({"logged_in": True}, exit_code=0)
             return
 
         qrcode_path = save_qrcode_to_file(png_bytes)
-        image_url, login_url = make_qrcode_url(png_bytes)
+        login_url = decode_qr_login_url(png_bytes)
         _open_file_if_display(qrcode_path)
+        _render_qr_in_terminal(login_url)
 
         result: dict = {
             "logged_in": False,
             "login_method": "qrcode",
             "qrcode_path": qrcode_path,
-            "qrcode_image_url": image_url,
-            "hint": "未登录，二维码已自动生成。扫码后运行 wait-login 等待登录结果",
+            "qrcode_image_url": qrcode_path,
+            "hint": (
+                "未登录，二维码已自动生成（终端已渲染 ASCII 二维码，本地 PNG 已打开）。"
+                "扫码后运行 wait-login 等待登录结果"
+            ),
         }
         if login_url:
             result["qr_login_url"] = login_url
@@ -211,23 +249,31 @@ def cmd_check_login(args: argparse.Namespace) -> None:
 
 def cmd_login(args: argparse.Namespace) -> None:
     """登录（扫码，阻塞等待完成）。"""
-    from xhs.login import fetch_qrcode, make_qrcode_url, save_qrcode_to_file, wait_for_login
+    from xhs.login import (
+        cleanup_qrcode_file,
+        decode_qr_login_url,
+        fetch_qrcode,
+        save_qrcode_to_file,
+        wait_for_login,
+    )
 
     browser, page = _connect(args)
     try:
         png_bytes, _b64_orig, already = fetch_qrcode(page)
         if already:
+            cleanup_qrcode_file()
             _output({"logged_in": True, "message": "已登录"})
             return
 
         qrcode_path = save_qrcode_to_file(png_bytes)
-        image_url, login_url = make_qrcode_url(png_bytes)
+        login_url = decode_qr_login_url(png_bytes)
         _open_file_if_display(qrcode_path)
+        _render_qr_in_terminal(login_url)
 
-        result: dict = {"qrcode_path": qrcode_path, "qrcode_image_url": image_url}
+        result: dict = {"qrcode_path": qrcode_path, "qrcode_image_url": qrcode_path}
         if login_url:
             result["qr_login_url"] = login_url
-        logger.info("二维码已生成，等待扫码...")
+        logger.info("二维码已生成（终端已渲染 ASCII 二维码），等待扫码...")
 
         success = wait_for_login(page, timeout=120)
         _output(
@@ -235,12 +281,19 @@ def cmd_login(args: argparse.Namespace) -> None:
             exit_code=0 if success else 2,
         )
     finally:
+        # 登录流程结束，清理临时二维码（内容即登录凭证）
+        cleanup_qrcode_file()
         browser.close()
 
 
 def cmd_get_qrcode(args: argparse.Namespace) -> None:
     """获取登录二维码截图并立即返回（非阻塞）。"""
-    from xhs.login import fetch_qrcode, make_qrcode_url, save_qrcode_to_file
+    from xhs.login import (
+        cleanup_qrcode_file,
+        decode_qr_login_url,
+        fetch_qrcode,
+        save_qrcode_to_file,
+    )
 
     browser, page = _connect(args)
     try:
@@ -248,18 +301,23 @@ def cmd_get_qrcode(args: argparse.Namespace) -> None:
         if already:
             browser.close_page(page)
             browser.close()
+            cleanup_qrcode_file()
             _output({"logged_in": True, "message": "已登录"})
             return
 
         qrcode_path = save_qrcode_to_file(png_bytes)
-        image_url, login_url = make_qrcode_url(png_bytes)
+        login_url = decode_qr_login_url(png_bytes)
         _open_file_if_display(qrcode_path)
+        _render_qr_in_terminal(login_url)
         browser.close()
 
         result: dict = {
             "qrcode_path": qrcode_path,
-            "qrcode_image_url": image_url,
-            "message": "二维码已生成，请扫码登录。扫码后运行 wait-login 等待登录结果。",
+            "qrcode_image_url": qrcode_path,
+            "message": (
+                "二维码已生成（终端已渲染 ASCII 二维码，本地 PNG 已打开），"
+                "请扫码登录。扫码后运行 wait-login 等待登录结果。"
+            ),
         }
         if login_url:
             result["qr_login_url"] = login_url
@@ -270,7 +328,7 @@ def cmd_get_qrcode(args: argparse.Namespace) -> None:
 
 def cmd_wait_login(args: argparse.Namespace) -> None:
     """等待扫码登录完成（配合 get-qrcode 使用）。"""
-    from xhs.login import wait_for_login
+    from xhs.login import cleanup_qrcode_file, wait_for_login
 
     browser, page = _connect_saved_tab(args)
     try:
@@ -278,11 +336,15 @@ def cmd_wait_login(args: argparse.Namespace) -> None:
         _output(
             {
                 "logged_in": success,
-                "message": "登录成功" if success else "等待超时，请重新运行 get-qrcode 获取新二维码",
+                "message": "登录成功"
+                if success
+                else "等待超时，请重新运行 get-qrcode 获取新二维码",
             },
             exit_code=0 if success else 2,
         )
     finally:
+        # 登录流程结束，清理临时二维码（内容即登录凭证）
+        cleanup_qrcode_file()
         browser.close()
 
 
@@ -324,13 +386,15 @@ def cmd_send_code(args: argparse.Namespace) -> None:
         if not sent:
             _output({"logged_in": True, "message": "已登录，无需重新登录"})
             return
-        _output({
-            "status": "code_sent",
-            "message": (
-                f"验证码已发送至 {args.phone[:3]}****{args.phone[-4:]}，"
-                "请运行 verify-code --code <验证码>"
-            ),
-        })
+        _output(
+            {
+                "status": "code_sent",
+                "message": (
+                    f"验证码已发送至 {args.phone[:3]}****{args.phone[-4:]}，"
+                    "请运行 verify-code --code <验证码>"
+                ),
+            }
+        )
     except RateLimitError:
         _qrcode_fallback(browser, page, args)
     finally:
@@ -401,6 +465,7 @@ def cmd_search_feeds(args: argparse.Namespace) -> None:
 def cmd_get_feed_detail(args: argparse.Namespace) -> None:
     """获取 Feed 详情。"""
     from xhs.feed_detail import get_feed_detail
+    from xhs.redact import redact_deep, redact_text
     from xhs.types import CommentLoadConfig
 
     config = CommentLoadConfig(
@@ -423,22 +488,26 @@ def cmd_get_feed_detail(args: argparse.Namespace) -> None:
         _output(detail.to_dict())
     except Exception as e:
         # 附带 404 诊断事件，帮助定位根因
+        import contextlib
+
         diagnostics: list = []
-        try:
+        with contextlib.suppress(Exception):
             diagnostics = page.get_404_diagnostics() or []
-        except Exception:
-            pass
-        err_data: dict = {"success": False, "error": str(e)}
+        err_data: dict = {"success": False, "error": redact_text(str(e))}
         if diagnostics:
             latest = diagnostics[-1]
-            err_data["diagnosis"] = {
-                "root_cause": latest.get("diagnosis", {}).get("root_cause"),
-                "cause_category": latest.get("diagnosis", {}).get("cause_category"),
-                "detail": latest.get("diagnosis", {}).get("detail"),
-                "how_xhs_decides": latest.get("diagnosis", {}).get("how_xhs_decides"),
-                "url": latest.get("url"),
-                "final_url": latest.get("final_url"),
-            }
+            diag = latest.get("diagnosis", {})
+            # 全字段深度脱敏：url/final_url 走 redact_url，其余字符串走 redact_text
+            err_data["diagnosis"] = redact_deep(
+                {
+                    "root_cause": diag.get("root_cause"),
+                    "cause_category": diag.get("cause_category"),
+                    "detail": diag.get("detail"),
+                    "how_xhs_decides": diag.get("how_xhs_decides"),
+                    "url": latest.get("url"),
+                    "final_url": latest.get("final_url"),
+                }
+            )
         _output(err_data, exit_code=2)
     finally:
         browser.close()
@@ -462,8 +531,9 @@ def cmd_post_comment(args: argparse.Namespace) -> None:
 
     browser, page = _connect(args)
     try:
-        post_comment(page, args.feed_id, args.xsec_token, args.content,
-                     keyword=getattr(args, "keyword", ""))
+        post_comment(
+            page, args.feed_id, args.xsec_token, args.content, keyword=getattr(args, "keyword", "")
+        )
         _output({"success": True, "message": "评论发送成功"})
     finally:
         browser.close()
@@ -496,11 +566,13 @@ def cmd_like_feed(args: argparse.Namespace) -> None:
     browser, page = _connect(args)
     try:
         if args.unlike:
-            result = unlike_feed(page, args.feed_id, args.xsec_token,
-                                 keyword=getattr(args, "keyword", ""))
+            result = unlike_feed(
+                page, args.feed_id, args.xsec_token, keyword=getattr(args, "keyword", "")
+            )
         else:
-            result = like_feed(page, args.feed_id, args.xsec_token,
-                               keyword=getattr(args, "keyword", ""))
+            result = like_feed(
+                page, args.feed_id, args.xsec_token, keyword=getattr(args, "keyword", "")
+            )
         _output(result.to_dict())
     finally:
         browser.close()
@@ -513,11 +585,13 @@ def cmd_favorite_feed(args: argparse.Namespace) -> None:
     browser, page = _connect(args)
     try:
         if args.unfavorite:
-            result = unfavorite_feed(page, args.feed_id, args.xsec_token,
-                                     keyword=getattr(args, "keyword", ""))
+            result = unfavorite_feed(
+                page, args.feed_id, args.xsec_token, keyword=getattr(args, "keyword", "")
+            )
         else:
-            result = favorite_feed(page, args.feed_id, args.xsec_token,
-                                   keyword=getattr(args, "keyword", ""))
+            result = favorite_feed(
+                page, args.feed_id, args.xsec_token, keyword=getattr(args, "keyword", "")
+            )
         _output(result.to_dict())
     finally:
         browser.close()
@@ -586,7 +660,14 @@ def cmd_fill_publish(args: argparse.Namespace) -> None:
                 visibility=args.visibility or "",
             ),
         )
-        _output({"success": True, "title": title, "images": len(image_paths), "status": "表单已填写，等待确认发布"})
+        _output(
+            {
+                "success": True,
+                "title": title,
+                "images": len(image_paths),
+                "status": "表单已填写，等待确认发布",
+            }
+        )
     finally:
         browser.close()
 
@@ -614,7 +695,14 @@ def cmd_fill_publish_video(args: argparse.Namespace) -> None:
                 visibility=args.visibility or "",
             ),
         )
-        _output({"success": True, "title": title, "video": args.video, "status": "视频表单已填写，等待确认发布"})
+        _output(
+            {
+                "success": True,
+                "title": title,
+                "video": args.video,
+                "status": "视频表单已填写，等待确认发布",
+            }
+        )
     finally:
         browser.close()
 
@@ -697,6 +785,8 @@ def cmd_next_step(args: argparse.Namespace) -> None:
 
 def cmd_diagnose_404(args: argparse.Namespace) -> None:
     """获取拦截器捕获的 404 诊断事件，打印根因分析报告。"""
+    from xhs.redact import redact_deep
+
     browser, page = _connect(args)
     try:
         if args.clear:
@@ -704,9 +794,16 @@ def cmd_diagnose_404(args: argparse.Namespace) -> None:
             _output({"success": True, "message": "诊断记录已清空"})
             return
 
-        events = page.get_404_diagnostics()
+        # 事件含请求 URL/cookie 快照，先深度脱敏再进入日志与 JSON 输出
+        events = [redact_deep(ev) for ev in page.get_404_diagnostics()]
         if not events:
-            _output({"success": True, "events": [], "message": "暂无拦截记录，请在小红书页面进行操作后重试"})
+            _output(
+                {
+                    "success": True,
+                    "events": [],
+                    "message": "暂无拦截记录，请在小红书页面进行操作后重试",
+                }
+            )
             return
 
         # 控制台可读报告（写到 stderr）
@@ -717,18 +814,29 @@ def cmd_diagnose_404(args: argparse.Namespace) -> None:
             diag = ev.get("diagnosis", {})
             logger.info(
                 "[%d] %s %s → HTTP %s",
-                i, ev.get("method", "?"), ev.get("url", "?")[:80], ev.get("status", "?"),
+                i,
+                ev.get("method", "?"),
+                ev.get("url", "?")[:80],
+                ev.get("status", "?"),
             )
             logger.info("    根因: %s", diag.get("root_cause", "未知"))
             logger.info("    详情: %s", diag.get("detail", "")[:120])
-            logger.info("    置信: %s | 类别: %s", diag.get("confidence", "?"), diag.get("cause_category", "?"))
-            logger.info("    时间: %s | 页面: %s", ev.get("timestamp", "?"), ev.get("pageUrl", "?")[:60])
+            logger.info(
+                "    置信: %s | 类别: %s",
+                diag.get("confidence", "?"),
+                diag.get("cause_category", "?"),
+            )
+            logger.info(
+                "    时间: %s | 页面: %s", ev.get("timestamp", "?"), ev.get("pageUrl", "?")[:60]
+            )
             cookies = ev.get("cookies", {})
             req = ev.get("request", {})
             logger.info(
                 "    凭证: web_session=%s a1=%s xs=%s xsec_token=%s",
-                cookies.get("has_web_session"), cookies.get("has_a1"),
-                req.get("has_xs"), bool(req.get("xsec_token")),
+                cookies.get("has_web_session"),
+                cookies.get("has_a1"),
+                req.get("has_xs"),
+                bool(req.get("xsec_token")),
             )
             logger.info("─" * 60)
 
@@ -739,7 +847,6 @@ def cmd_diagnose_404(args: argparse.Namespace) -> None:
 
 def cmd_check_risk(args: argparse.Namespace) -> None:
     """分析小红书风控状态：检测自动化特征与 API 拦截情况。"""
-    import json as _json
 
     browser, page = _connect(args)
     try:
@@ -767,39 +874,59 @@ def cmd_get_netlog(args: argparse.Namespace) -> None:
     browser, page = _connect(args)
     try:
         if not page.get_netlog_enabled():
-            print(json.dumps({
-                "error": "netlogger 未启用",
-                "hint": "请打开扩展 popup，标题 XHS Bridge 连点 5 次激活 NetLog 后重试",
-            }, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "error": "netlogger 未启用",
+                        "hint": "请打开扩展 popup，标题 XHS Bridge 连点 5 次激活 NetLog 后重试",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             sys.exit(2)
 
         entries = page.get_netlog()
         if args.limit:
-            entries = entries[-args.limit:]
-        print(json.dumps({
-            "total": len(entries),
-            "entries": entries,
-        }, ensure_ascii=False, indent=2))
+            entries = entries[-args.limit :]
+        print(
+            json.dumps(
+                {
+                    "total": len(entries),
+                    "entries": entries,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     finally:
         browser.close()
 
 
 def cmd_risk_report(args: argparse.Namespace) -> None:
     """基于 NetLog 数据生成风控分析报告。"""
+    from xhs.redact import redact_deep
     from xhs.risk_analyzer import analyze
 
     browser, page = _connect(args)
     try:
         if not page.get_netlog_enabled():
-            print(json.dumps({
-                "error": "netlogger 未启用",
-                "hint": "请打开扩展 popup，标题 XHS Bridge 连点 5 次激活 NetLog 后重试",
-            }, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "error": "netlogger 未启用",
+                        "hint": "请打开扩展 popup，标题 XHS Bridge 连点 5 次激活 NetLog 后重试",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             sys.exit(2)
 
         entries = page.get_netlog()
         report = analyze(entries)
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        # 报告的 path/redirectTo 等字段可能携带 xsec_token，输出前深度脱敏
+        print(json.dumps(redact_deep(report), ensure_ascii=False, indent=2))
     finally:
         browser.close()
 
@@ -1053,8 +1180,14 @@ def main() -> None:
     try:
         args.func(args)
     except Exception as e:
-        logger.error("执行失败: %s", e, exc_info=True)
-        _output({"success": False, "error": str(e)}, exit_code=2)
+        # 仅在 XHS_DEBUG=1 时输出完整 traceback，避免默认泄露 URL 等敏感上下文
+        from xhs.redact import redact_text
+
+        # 异常消息可能携带完整 xsec_token（如扩展抛错含 /404?source=<原URL>），输出前脱敏
+        redacted_error = redact_text(str(e))
+        exc_info = os.getenv("XHS_DEBUG") == "1"
+        logger.error("执行失败: %s", redacted_error, exc_info=exc_info)
+        _output({"success": False, "error": redacted_error}, exit_code=2)
 
 
 if __name__ == "__main__":
