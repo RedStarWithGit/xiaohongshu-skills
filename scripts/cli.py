@@ -462,7 +462,8 @@ def cmd_post_comment(args: argparse.Namespace) -> None:
 
     browser, page = _connect(args)
     try:
-        post_comment(page, args.feed_id, args.xsec_token, args.content)
+        post_comment(page, args.feed_id, args.xsec_token, args.content,
+                     keyword=getattr(args, "keyword", ""))
         _output({"success": True, "message": "评论发送成功"})
     finally:
         browser.close()
@@ -481,6 +482,7 @@ def cmd_reply_comment(args: argparse.Namespace) -> None:
             args.content,
             comment_id=args.comment_id or "",
             user_id=args.user_id or "",
+            keyword=getattr(args, "keyword", ""),
         )
         _output({"success": True, "message": "回复成功"})
     finally:
@@ -494,9 +496,11 @@ def cmd_like_feed(args: argparse.Namespace) -> None:
     browser, page = _connect(args)
     try:
         if args.unlike:
-            result = unlike_feed(page, args.feed_id, args.xsec_token)
+            result = unlike_feed(page, args.feed_id, args.xsec_token,
+                                 keyword=getattr(args, "keyword", ""))
         else:
-            result = like_feed(page, args.feed_id, args.xsec_token)
+            result = like_feed(page, args.feed_id, args.xsec_token,
+                               keyword=getattr(args, "keyword", ""))
         _output(result.to_dict())
     finally:
         browser.close()
@@ -509,9 +513,11 @@ def cmd_favorite_feed(args: argparse.Namespace) -> None:
     browser, page = _connect(args)
     try:
         if args.unfavorite:
-            result = unfavorite_feed(page, args.feed_id, args.xsec_token)
+            result = unfavorite_feed(page, args.feed_id, args.xsec_token,
+                                     keyword=getattr(args, "keyword", ""))
         else:
-            result = favorite_feed(page, args.feed_id, args.xsec_token)
+            result = favorite_feed(page, args.feed_id, args.xsec_token,
+                                   keyword=getattr(args, "keyword", ""))
         _output(result.to_dict())
     finally:
         browser.close()
@@ -916,6 +922,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--feed-id", required=True)
     sub.add_argument("--xsec-token", required=True)
     sub.add_argument("--content", required=True)
+    sub.add_argument("--keyword", default="", help="搜索关键词，提供时模拟点击搜索结果卡片进入")
     sub.set_defaults(func=cmd_post_comment)
 
     # reply-comment
@@ -925,6 +932,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--content", required=True)
     sub.add_argument("--comment-id")
     sub.add_argument("--user-id")
+    sub.add_argument("--keyword", default="", help="搜索关键词，提供时模拟点击搜索结果卡片进入")
     sub.set_defaults(func=cmd_reply_comment)
 
     # like-feed
@@ -932,6 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--feed-id", required=True)
     sub.add_argument("--xsec-token", required=True)
     sub.add_argument("--unlike", action="store_true")
+    sub.add_argument("--keyword", default="", help="搜索关键词，提供时模拟点击搜索结果卡片进入")
     sub.set_defaults(func=cmd_like_feed)
 
     # favorite-feed
@@ -939,6 +948,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--feed-id", required=True)
     sub.add_argument("--xsec-token", required=True)
     sub.add_argument("--unfavorite", action="store_true")
+    sub.add_argument("--keyword", default="", help="搜索关键词，提供时模拟点击搜索结果卡片进入")
     sub.set_defaults(func=cmd_favorite_feed)
 
     # publish

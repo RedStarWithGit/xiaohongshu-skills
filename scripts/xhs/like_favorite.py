@@ -8,9 +8,9 @@ import time
 
 from .cdp import Page
 from .errors import NoFeedDetailError
+from .note_entry import open_note_detail
 from .selectors import COLLECT_BUTTON, LIKE_BUTTON
 from .types import ActionResult
-from .urls import make_feed_detail_url
 
 logger = logging.getLogger(__name__)
 
@@ -52,27 +52,24 @@ def _get_interact_state(page: Page, feed_id: str) -> tuple[bool, bool]:
     return interact.get("liked", False), interact.get("collected", False)
 
 
-def _prepare_page(page: Page, feed_id: str, xsec_token: str) -> None:
-    """导航到 feed 详情页。"""
-    url = make_feed_detail_url(feed_id, xsec_token)
-    page.navigate(url)
-    page.wait_for_load()
-    page.wait_dom_stable()
+def _prepare_page(page: Page, feed_id: str, xsec_token: str, keyword: str = "") -> None:
+    """进入 feed 详情页（keyword 提供时模拟点击搜索结果卡片）。"""
+    open_note_detail(page, feed_id, xsec_token, keyword)
     time.sleep(1)
 
 
 # ========== 点赞 ==========
 
 
-def like_feed(page: Page, feed_id: str, xsec_token: str) -> ActionResult:
+def like_feed(page: Page, feed_id: str, xsec_token: str, keyword: str = "") -> ActionResult:
     """点赞笔记（幂等：已点赞则跳过）。"""
-    _prepare_page(page, feed_id, xsec_token)
+    _prepare_page(page, feed_id, xsec_token, keyword)
     return _toggle_like(page, feed_id, target_liked=True)
 
 
-def unlike_feed(page: Page, feed_id: str, xsec_token: str) -> ActionResult:
+def unlike_feed(page: Page, feed_id: str, xsec_token: str, keyword: str = "") -> ActionResult:
     """取消点赞（幂等：未点赞则跳过）。"""
-    _prepare_page(page, feed_id, xsec_token)
+    _prepare_page(page, feed_id, xsec_token, keyword)
     return _toggle_like(page, feed_id, target_liked=False)
 
 
@@ -115,15 +112,15 @@ def _toggle_like(page: Page, feed_id: str, target_liked: bool) -> ActionResult:
 # ========== 收藏 ==========
 
 
-def favorite_feed(page: Page, feed_id: str, xsec_token: str) -> ActionResult:
+def favorite_feed(page: Page, feed_id: str, xsec_token: str, keyword: str = "") -> ActionResult:
     """收藏笔记（幂等：已收藏则跳过）。"""
-    _prepare_page(page, feed_id, xsec_token)
+    _prepare_page(page, feed_id, xsec_token, keyword)
     return _toggle_favorite(page, feed_id, target_collected=True)
 
 
-def unfavorite_feed(page: Page, feed_id: str, xsec_token: str) -> ActionResult:
+def unfavorite_feed(page: Page, feed_id: str, xsec_token: str, keyword: str = "") -> ActionResult:
     """取消收藏（幂等：未收藏则跳过）。"""
-    _prepare_page(page, feed_id, xsec_token)
+    _prepare_page(page, feed_id, xsec_token, keyword)
     return _toggle_favorite(page, feed_id, target_collected=False)
 
 

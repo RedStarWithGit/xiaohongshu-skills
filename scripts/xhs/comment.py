@@ -7,6 +7,7 @@ import logging
 from .cdp import Page
 from .feed_detail import _check_end_container, _check_page_accessible, _get_comment_count
 from .human import sleep_random
+from .note_entry import open_note_detail
 from .selectors import (
     COMMENT_INPUT_FIELD,
     COMMENT_INPUT_TRIGGER,
@@ -14,12 +15,13 @@ from .selectors import (
     PARENT_COMMENT,
     REPLY_BUTTON,
 )
-from .urls import make_feed_detail_url
 
 logger = logging.getLogger(__name__)
 
 
-def post_comment(page: Page, feed_id: str, xsec_token: str, content: str) -> None:
+def post_comment(
+    page: Page, feed_id: str, xsec_token: str, content: str, keyword: str = ""
+) -> None:
     """发表评论到 Feed。
 
     Args:
@@ -27,16 +29,12 @@ def post_comment(page: Page, feed_id: str, xsec_token: str, content: str) -> Non
         feed_id: Feed ID。
         xsec_token: xsec_token。
         content: 评论内容。
+        keyword: 搜索关键词，提供时模拟点击搜索结果卡片进入。
 
     Raises:
         RuntimeError: 评论失败。
     """
-    url = make_feed_detail_url(feed_id, xsec_token)
-    logger.info("打开 feed 详情页: %s", url)
-
-    page.navigate(url)
-    page.wait_for_load()
-    page.wait_dom_stable()
+    open_note_detail(page, feed_id, xsec_token, keyword)
     sleep_random(800, 1500)
 
     _check_page_accessible(page)
@@ -67,6 +65,7 @@ def reply_comment(
     content: str,
     comment_id: str = "",
     user_id: str = "",
+    keyword: str = "",
 ) -> None:
     """回复指定评论。
 
@@ -79,6 +78,7 @@ def reply_comment(
         content: 回复内容。
         comment_id: 评论 ID（优先使用）。
         user_id: 用户 ID（备选）。
+        keyword: 搜索关键词，提供时模拟点击搜索结果卡片进入。
 
     Raises:
         RuntimeError: 回复失败。
@@ -86,12 +86,7 @@ def reply_comment(
     if not comment_id and not user_id:
         raise ValueError("comment_id 和 user_id 至少提供一个")
 
-    url = make_feed_detail_url(feed_id, xsec_token)
-    logger.info("打开 feed 详情页进行回复: %s", url)
-
-    page.navigate(url)
-    page.wait_for_load()
-    page.wait_dom_stable()
+    open_note_detail(page, feed_id, xsec_token, keyword)
     sleep_random(800, 1500)
 
     _check_page_accessible(page)
