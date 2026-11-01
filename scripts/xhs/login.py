@@ -49,7 +49,6 @@ def _wait_for_countdown(page: Page, timeout: float = 5.0) -> None:
     raise RateLimitError()
 
 
-
 def get_current_user_nickname(page: Page) -> str:
     """获取当前登录用户的真实昵称，失败时返回空字符串（best-effort）。
 
@@ -63,7 +62,8 @@ def get_current_user_nickname(page: Page) -> str:
 
         # 从导航栏"我"的链接取个人主页 URL（含 /user/profile/<user_id>）
         profile_href = page.evaluate(
-            f"document.querySelector({json.dumps(USER_PROFILE_NAV_LINK)})?.getAttribute('href') || ''"
+            f"document.querySelector({json.dumps(USER_PROFILE_NAV_LINK)})"
+            f"?.getAttribute('href') || ''"
         )
         if not profile_href:
             return ""
@@ -130,89 +130,49 @@ def fetch_qrcode(page: Page) -> tuple[bytes, str, bool]:
     page.wait_for_element(QRCODE_IMG, timeout=15.0)
 
     # img.src 本身就是 data:image/png;base64,...，直接读取
-    src = page.evaluate(
-        f"document.querySelector({json.dumps(QRCODE_IMG)})?.src || ''"
-    )
+    src = page.evaluate(f"document.querySelector({json.dumps(QRCODE_IMG)})?.src || ''")
     if not src or "base64," not in src:
         raise RuntimeError("二维码图片 src 读取失败")
 
     b64_str = src.split("base64,", 1)[1]
 
     import base64
+
     png_bytes = base64.b64decode(b64_str)
 
     return png_bytes, b64_str, False
 
 
-def _decode_qr_content(png_bytes: bytes) -> str | None:
-    """通过 goqr.me read API 解码二维码内容。
+def decode_qr_login_url(png_bytes: bytes) -> str | None:
+    """本地解码二维码内容（cv2.QRCodeDetector），全程不外发任何数据。
 
     Returns:
-        解码后的文本（通常是登录 URL），失败返回 None。
+        解码后的文本（通常是登录 URL），解码失败返回 None。
     """
-    import http.client
-
-    boundary = "----XhsQrBoundary"
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file";'
-        f' filename="qr.png"\r\n'
-        f"Content-Type: image/png\r\n\r\n"
-    ).encode() + png_bytes + f"\r\n--{boundary}--\r\n".encode()
-
     try:
-        conn = http.client.HTTPSConnection(
-            "api.qrserver.com", timeout=5
-        )
-        conn.request(
-            "POST",
-            "/v1/read-qr-code/",
-            body=body,
-            headers={
-                "Content-Type": (
-                    f"multipart/form-data; boundary={boundary}"
-                ),
-            },
-        )
-        resp = conn.getresponse()
-        if resp.status != 200:
+        import cv2
+        import numpy as np
+
+        data = np.frombuffer(png_bytes, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img is None:
             return None
-        result = json.loads(resp.read().decode())
-        data = result[0]["symbol"][0].get("data")
-        return data if data else None
+        text, _points, _straight = cv2.QRCodeDetector().detectAndDecode(img)
+        return text or None
     except Exception:
-        logger.debug("goqr.me 解码失败，将使用 base64 fallback")
+        logger.debug("本地解码二维码失败，可扫描已保存的 PNG 文件")
         return None
 
 
-def make_qrcode_url(
-    png_bytes: bytes,
-) -> tuple[str, str | None]:
-    """生成二维码展示 URL 和登录链接。
+def cleanup_qrcode_file() -> None:
+    """删除临时二维码 PNG（二维码内容即登录凭证，登录流程结束须清理）。
 
-    通过 goqr.me read API 解码 QR 内容，构造 API 图片 URL
-    （~270 字符）和小红书官方登录链接。
-
-    Returns:
-        (image_url, login_url)
-        - image_url: 可用于 markdown 图片的 URL
-        - login_url: 小红书官方登录链接（解码失败时为 None）
+    文件不存在时静默跳过。
     """
-    import base64
-    import urllib.parse
+    import contextlib
 
-    qr_content = _decode_qr_content(png_bytes)
-    if qr_content:
-        image_url = (
-            "https://api.qrserver.com/v1/create-qr-code/"
-            "?size=300x300&data="
-            + urllib.parse.quote(qr_content, safe="")
-        )
-        return image_url, qr_content
-
-    # fallback: base64 data URL
-    b64 = base64.b64encode(png_bytes).decode()
-    return "data:image/png;base64," + b64, None
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(_QR_FILE)
 
 
 def save_qrcode_to_file(png_bytes: bytes) -> str:
