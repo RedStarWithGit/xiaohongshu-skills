@@ -59,6 +59,7 @@ metadata:
 
 ## 必做约束
 
+- **逐关键词浏览（强制）**：多关键词任务必须逐个关键词执行「搜索 → 浏览结果 → 进入若干笔记看详情」的完整循环，看完当前关键词的 2~3 篇再换下一个。**严禁**先把所有关键词都搜索完、再拿着 ID 清单逐个进入笔记。
 - 复合流程中每一步都应向用户报告进度。
 - 发布类操作必须经过用户确认（参考 xhs-publish 约束）。
 - 评论类操作必须经过用户确认（参考 xhs-interact 约束）。
@@ -79,11 +80,12 @@ metadata:
 python scripts/cli.py search-feeds \
   --keyword "目标关键词" --sort-by 最多点赞
 ```
-3. 从搜索结果中选取 3-5 篇高互动笔记，逐一获取详情：
+3. 紧跟本次搜索，从结果中选取 3-5 篇高互动笔记**立即逐篇**获取详情（`--keyword` 与搜索一致，模拟点击进入）：
 ```bash
 python scripts/cli.py get-feed-detail \
-  --feed-id FEED_ID --xsec-token XSEC_TOKEN
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "目标关键词"
 ```
+每 3 篇插入 10~20 秒等待。不要等所有搜索完成后统一获取详情。
 4. 整理分析报告，包含：
    - 标题风格分析
    - 封面图特点
@@ -97,23 +99,32 @@ python scripts/cli.py get-feed-detail \
 
 ### 热点追踪
 
-目标：搜索热门关键词 → 分析趋势 → 提供选题建议。
+目标：逐关键词「搜索 → 浏览 → 看帖」→ 分析趋势 → 提供选题建议。
 
 **步骤：**
 
 1. 确认追踪领域或关键词列表。
-2. 对每个关键词分别搜索：
-```bash
-# 按最新排序，观察近期热度
-python scripts/cli.py search-feeds \
-  --keyword "关键词" --sort-by 最新 --publish-time 一周内
+2. **逐关键词执行完整循环**（严禁先把所有关键词搜完再统一看帖）：
 
-# 按最多点赞排序，找爆款
-python scripts/cli.py search-feeds \
-  --keyword "关键词" --sort-by 最多点赞
-```
-3. 对高互动笔记获取详情，分析内容模式。
-4. 输出趋势报告：
+   对列表中的每个关键词依次执行：
+
+   ```bash
+   # ① 搜索当前关键词（按最新排序，观察近期热度）
+   python scripts/cli.py search-feeds \
+     --keyword "关键词" --sort-by 最新 --publish-time 一周内
+
+   # 按最多点赞排序，找爆款（可选，与上面二选一或都做）
+   python scripts/cli.py search-feeds \
+     --keyword "关键词" --sort-by 最多点赞
+
+   # ② 浏览结果，选取 2~3 篇高互动笔记立即进入查看
+   #    --keyword 必须与刚才的搜索一致（模拟点击进入，复用搜索页上下文）
+   python scripts/cli.py get-feed-detail \
+     --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "关键词"
+   ```
+
+   看完当前关键词的 2~3 篇后，等待 10~20 秒，再切换到下一个关键词重复 ①②。
+3. 全部关键词处理完毕后，汇总输出趋势报告：
    - 各关键词热度排名
    - 爆款内容特征
    - 选题建议
@@ -130,7 +141,11 @@ python scripts/cli.py search-feeds \
 python scripts/cli.py search-feeds \
   --keyword "主题关键词" --sort-by 最多点赞
 ```
-3. 选取 2-3 篇参考笔记，获取详情分析内容结构。
+3. 选取 2-3 篇参考笔记，**紧跟搜索立即**获取详情分析内容结构（`--keyword` 与搜索一致）：
+```bash
+python scripts/cli.py get-feed-detail \
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "主题关键词"
+```
 4. 基于分析结果，辅助用户生成草稿：
    - 标题（符合小红书风格，UTF-16 长度 ≤ 20）
    - 正文（段落清晰，口语化）
@@ -158,26 +173,27 @@ python scripts/cli.py search-feeds \
   --keyword "目标关键词" --sort-by 最新
 ```
 3. 筛选适合互动的笔记（中等互动量、与自身领域相关）。
-4. 获取详情，了解笔记内容：
+4. 逐篇处理（看完一篇互动一篇，不要先看完所有详情再统一互动）——获取详情了解笔记内容：
 ```bash
 python scripts/cli.py get-feed-detail \
-  --feed-id FEED_ID --xsec-token XSEC_TOKEN
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "目标关键词"
 ```
 5. 针对笔记内容生成有价值的评论建议。
-6. 用户确认评论内容后发送：
+6. 用户确认评论内容后发送（`--keyword` 与搜索一致，模拟点击进入）：
 ```bash
 python scripts/cli.py post-comment \
   --feed-id FEED_ID \
   --xsec-token XSEC_TOKEN \
-  --content "评论内容"
+  --content "评论内容" \
+  --keyword "目标关键词"
 ```
 7. 可选：点赞或收藏：
 ```bash
 python scripts/cli.py like-feed \
-  --feed-id FEED_ID --xsec-token XSEC_TOKEN
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "目标关键词"
 
 python scripts/cli.py favorite-feed \
-  --feed-id FEED_ID --xsec-token XSEC_TOKEN
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "目标关键词"
 ```
 8. 每次互动之间保持 30-60 秒间隔。
 

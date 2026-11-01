@@ -116,9 +116,9 @@ python scripts/cli.py login
 # 4. 搜索笔记
 python scripts/cli.py search-feeds --keyword "关键词"
 
-# 5. 查看笔记详情
+# 5. 查看笔记详情（传 --keyword 模拟真人：从搜索结果页点击卡片进入）
 python scripts/cli.py get-feed-detail \
-  --feed-id FEED_ID --xsec-token XSEC_TOKEN
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "关键词"
 
 # 6. 发布图文
 python scripts/cli.py publish \
@@ -126,16 +126,19 @@ python scripts/cli.py publish \
   --content-file content.txt \
   --images "/abs/path/pic1.jpg"
 
-# 7. 发表评论
+# 7. 发表评论（--keyword 与搜索一致时模拟点击进入）
 python scripts/cli.py post-comment \
   --feed-id FEED_ID \
   --xsec-token XSEC_TOKEN \
-  --content "评论内容"
+  --content "评论内容" \
+  --keyword "关键词"
 
 # 8. 点赞
 python scripts/cli.py like-feed \
-  --feed-id FEED_ID --xsec-token XSEC_TOKEN
+  --feed-id FEED_ID --xsec-token XSEC_TOKEN --keyword "关键词"
 ```
+
+> **浏览节奏**：多关键词场景下，逐个关键词完成「搜索 → 浏览 → 看几篇详情」后再换下一个关键词，严禁先搜完所有关键词再统一看帖。
 
 ## 失败处理
 

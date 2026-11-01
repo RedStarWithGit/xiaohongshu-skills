@@ -53,6 +53,8 @@ metadata:
 
 ## 必做约束
 
+- **逐关键词浏览（强制）**：涉及多个关键词时，必须逐个关键词完成「搜索 → 浏览结果 → 进入若干笔记看详情」的完整循环后，才能切换到下一个关键词。**严禁**先把所有关键词都搜索完、再逐个进入笔记——这不是真人的浏览方式，极易触发风控。
+- **xsec_token 即取即用**：token 与产生它的搜索会话绑定，应在对应关键词搜索后立即使用；跨关键词长期滞留可能失效。
 - **控制查询频率**：避免频繁、连续地搜索或加载大量内容，操作之间保持适当间隔。
 - 所有操作需要已登录的 Chrome 浏览器。
 - `feed_id` 和 `xsec_token` 必须配对使用，从搜索结果或首页 Feed 中获取。
@@ -110,24 +112,28 @@ python scripts/cli.py search-feeds \
 
 ### 获取笔记详情
 
-从搜索结果或首页 Feed 中取 `id` 和 `xsec_token`，获取完整内容：
+从搜索结果中取 `id` 和 `xsec_token`，**紧跟当前关键词的搜索**获取详情（不要攒到最后统一获取）。
+传 `--keyword` 时工具会模拟真人行为：打开该关键词的搜索结果页，定位到这篇笔记的卡片并点击进入（找不到卡片时自动 URL 兜底）：
 
 ```bash
-# 基础详情
+# 基础详情（推荐始终传 --keyword，模拟真人点击进入）
 python scripts/cli.py get-feed-detail \
   --feed-id 67abc1234def567890123456 \
-  --xsec-token XSEC_TOKEN
+  --xsec-token XSEC_TOKEN \
+  --keyword "春招"
 
 # 加载全部评论
 python scripts/cli.py get-feed-detail \
   --feed-id 67abc1234def567890123456 \
   --xsec-token XSEC_TOKEN \
+  --keyword "春招" \
   --load-all-comments
 
 # 加载全部评论（展开子评论）
 python scripts/cli.py get-feed-detail \
   --feed-id 67abc1234def567890123456 \
   --xsec-token XSEC_TOKEN \
+  --keyword "春招" \
   --load-all-comments \
   --click-more-replies \
   --max-replies-threshold 10
@@ -136,33 +142,33 @@ python scripts/cli.py get-feed-detail \
 python scripts/cli.py get-feed-detail \
   --feed-id 67abc1234def567890123456 \
   --xsec-token XSEC_TOKEN \
+  --keyword "春招" \
   --load-all-comments \
   --max-comment-items 50
 ```
 
 输出包含：笔记完整内容、图片列表、互动数据、评论列表。
 
-### 批量获取详情的防风控策略
+### 连续看帖的防风控策略
 
 **重要**：小红书会在同一 session 连续访问 4~5 篇详情后触发扫码验证（风控机制）。
-批量获取时必须每 3 篇插入一次随机等待，模拟人类阅读节奏。
+
+正确节奏（模拟真人「搜索→翻看几篇→换关键词」）：
 
 ```bash
-# 正确做法：每 3 篇后 sleep 10~20 秒
-python scripts/cli.py get-feed-detail --feed-id ID1 --xsec-token TOKEN1 && \
-python scripts/cli.py get-feed-detail --feed-id ID2 --xsec-token TOKEN2 && \
-python scripts/cli.py get-feed-detail --feed-id ID3 --xsec-token TOKEN3 && \
+# 同一关键词：搜索一次，连续看 2~3 篇（--keyword 保持一致，工具会复用搜索页上下文）
+python scripts/cli.py get-feed-detail --feed-id ID1 --xsec-token TOKEN1 --keyword "春招" && \
+python scripts/cli.py get-feed-detail --feed-id ID2 --xsec-token TOKEN2 --keyword "春招" && \
+python scripts/cli.py get-feed-detail --feed-id ID3 --xsec-token TOKEN3 --keyword "春招" && \
 sleep $((RANDOM % 10 + 10)) && \
-python scripts/cli.py get-feed-detail --feed-id ID4 --xsec-token TOKEN4 && \
-python scripts/cli.py get-feed-detail --feed-id ID5 --xsec-token TOKEN5 && \
-python scripts/cli.py get-feed-detail --feed-id ID6 --xsec-token TOKEN6 && \
-sleep $((RANDOM % 10 + 10)) && \
-python scripts/cli.py get-feed-detail --feed-id ID7 --xsec-token TOKEN7
+python scripts/cli.py search-feeds --keyword "秋招" && \
+python scripts/cli.py get-feed-detail --feed-id ID4 --xsec-token TOKEN4 --keyword "秋招" && \
+python scripts/cli.py get-feed-detail --feed-id ID5 --xsec-token TOKEN5 --keyword "秋招"
 ```
 
-- 每组不超过 3 篇
-- 组间等待 10~20 秒（用 `$((RANDOM % 10 + 10))` 随机化）
-- 不要把所有命令无间隔地串在一起
+- 每个关键词看 2~3 篇后，等待 10~20 秒再换下一个关键词
+- 同一关键词内连续看帖时 `--keyword` 保持一致（复用搜索结果页，避免反复整页刷新）
+- **禁止**把所有关键词的搜索先做完、再拿着 ID 清单逐个进入——先搜后看必须交替进行
 
 ### 获取用户主页
 
