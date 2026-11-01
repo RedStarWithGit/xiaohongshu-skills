@@ -15,6 +15,7 @@ from .human import (
     BUTTON_CLICK_INTERVAL,
     DEFAULT_MAX_ATTEMPTS,
     FINAL_SPRINT_PUSH_COUNT,
+    HOVER_TIME,
     HUMAN_DELAY,
     LARGE_SCROLL_TRIGGER,
     MAX_CLICK_PER_ROUND,
@@ -29,9 +30,13 @@ from .human import (
     get_scroll_ratio,
     sleep_random,
 )
+from .note_entry import open_note_detail
 from .selectors import (
     ACCESS_ERROR_WRAPPER,
+    CAROUSEL_FRACTION,
+    CAROUSEL_NEXT_ARROW_CANDIDATES,
     END_CONTAINER,
+    MEDIA_CONTAINER,
     NO_COMMENTS_TEXT,
     PARENT_COMMENT,
     SHOW_MORE_BUTTON,
@@ -97,8 +102,7 @@ def get_feed_detail(
     if config is None:
         config = CommentLoadConfig()
 
-    url = make_feed_detail_url(feed_id, xsec_token)
-    logger.info("打开 feed 详情页: %s", url)
+    detail_url = make_feed_detail_url(feed_id, xsec_token)
     logger.info(
         "配置: 点击更多=%s, 回复阈值=%d, 最大评论数=%d, 滚动速度=%s",
         config.click_more_replies,
@@ -107,24 +111,9 @@ def get_feed_detail(
         config.scroll_speed,
     )
 
-    # 导航（含重试）
-    # 注：风控 302→/404 由扩展 auto-fix（自动从搜索页换新 token 重试），
-    # 此处只捕获真正的瞬态错误（网络超时等），风控拦截不重试。
-    for attempt in range(3):
-        try:
-            page.navigate(url)
-            page.wait_for_load()
-            page.wait_dom_stable()
-            break
-        except Exception as e:
-            err_str = str(e)
-            # 风控 302 重定向：扩展已尝试 auto-fix，仍失败说明 token/session 问题，直接抛出
-            if "风控拦截" in err_str or "重定向至" in err_str:
-                raise PageNotAccessibleError(f"笔记无法访问（风控/token）: {err_str}") from e
-            logger.debug("页面导航重试 #%d: %s", attempt, e)
-            time.sleep(0.5 + random.random())
-    else:
-        raise RuntimeError("页面导航失败")
+    # 进入笔记：优先模拟"搜索结果页点击卡片"，失败兜底 URL 直达
+    entered_by_click = open_note_detail(page, feed_id, xsec_token, keyword)
+    logger.info("进入方式: %s", "点击搜索结果卡片" if entered_by_click else "URL 直达")
 
     sleep_random(800, 1500)
 
@@ -135,7 +124,10 @@ def get_feed_detail(
         pass
 
     # 检查页面可访问性（扫码验证时自动等待重试）
-    _check_page_accessible(page, url, keyword)
+    _check_page_accessible(page, detail_url, keyword)
+
+    # 图文笔记：模拟真人翻页浏览图片（best-effort）
+    _browse_note_images(page, feed_id)
 
     # 加载全部评论
     if load_all_comments:
@@ -226,6 +218,158 @@ def _check_page_accessible(page: Page, url: str = "", keyword: str = "篮球") -
 def _is_scan_qrcode_verification(text: str) -> bool:
     """判断页面文本是否为扫码验证。"""
     return any(kw in text for kw in _SCAN_QRCODE_KEYWORDS)
+
+
+# ========== 图片浏览（图文笔记模拟真人翻页） ==========
+
+# 读取当前笔记类型与图片数
+_GET_NOTE_META_JS = """
+(() => {
+    const m = window.__INITIAL_STATE__ &&
+              window.__INITIAL_STATE__.note &&
+              window.__INITIAL_STATE__.note.noteDetailMap;
+    if (!m) return "";
+    for (const k of Object.keys(m)) {
+        const note = m[k] && m[k].note;
+        if (note && note.type) {
+            return JSON.stringify({
+                type: note.type,
+                imageCount: Array.isArray(note.imageList) ? note.imageList.length : 0,
+            });
+        }
+    }
+    return "";
+})()
+"""
+
+# 读取轮播当前位置：优先 fraction 文本（"2/6"），其次激活 slide 索引
+_GET_CAROUSEL_STATE_JS = """
+(() => {
+    const frac = document.querySelector('__FRACTION_SEL__');
+    const fracText = frac ? (frac.textContent || '').trim() : '';
+    const active = document.querySelector('.swiper-slide-active');
+    const idx = active ? active.getAttribute('data-swiper-slide-index') : '';
+    return {fraction: fracText, activeIndex: idx};
+})()
+""".replace("__FRACTION_SEL__", CAROUSEL_FRACTION)
+
+# 悬停媒体区触发箭头渲染后，查找右箭头（真实 DOM：.arrow-controller.right > .btn-wrapper）
+_FIND_NEXT_ARROW_JS = """
+((candidates) => {
+    for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const ac = el.closest('.arrow-controller');
+        if (ac && ac.classList.contains('forbidden')) return {forbidden: true};
+        return {x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2)};
+    }
+    return null;
+})
+"""
+
+
+def _browse_note_images(page: Page, feed_id: str) -> None:
+    """图文笔记：模拟真人翻页浏览图片（悬停媒体区→点击右箭头→逐张停留阅读）。
+
+    视频笔记或单图笔记跳过；全程 best-effort，任何异常不影响详情获取。
+    """
+    try:
+        meta = _get_note_meta(page)
+        note_type = str(meta.get("type", ""))
+        image_count = int(meta.get("imageCount", 0))
+        if note_type != "img" or image_count <= 1:
+            return
+
+        logger.info("图文笔记共 %d 张图片，开始翻页浏览", image_count)
+        last_position = _carousel_position(page)
+
+        for _ in range(image_count - 1):
+            if not _click_next_image(page):
+                logger.debug("无法继续切换下一张图片，结束浏览")
+                break
+            current_position = _carousel_position(page)
+            if current_position and current_position == last_position:
+                logger.debug("图片位置未变化，结束浏览")
+                break
+            last_position = current_position
+            # 每张图停留"阅读"，偶尔长停顿（细看某张图）
+            if random.random() < 0.2:
+                sleep_random(2000, 3500)
+            else:
+                sleep_random(800, 2000)
+
+        logger.info("图片浏览结束，当前位置: %s", last_position or "未知")
+    except Exception as e:
+        logger.warning("图片浏览失败（忽略，不影响详情获取）: %s", e)
+
+
+def _get_note_meta(page: Page) -> dict:
+    """从 __INITIAL_STATE__ 读取笔记类型与图片数（短轮询）。"""
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        result = page.evaluate(_GET_NOTE_META_JS)
+        if result:
+            try:
+                return json.loads(result)
+            except json.JSONDecodeError:
+                pass
+        time.sleep(0.3)
+    return {}
+
+
+def _carousel_position(page: Page) -> str:
+    """读取轮播当前位置（fraction 文本或激活 slide 索引）。"""
+    try:
+        state = page.evaluate(_GET_CAROUSEL_STATE_JS)
+    except Exception:
+        return ""
+    if isinstance(state, dict):
+        return str(state.get("fraction") or state.get("activeIndex") or "")
+    return ""
+
+
+def _click_next_image(page: Page) -> bool:
+    """点击轮播右箭头切换下一张（CDP 真实点击，isTrusted=true）。
+
+    箭头仅 hover 时渲染：先用真实鼠标移入媒体区触发渲染，再定位并点击。
+    """
+    # 1. 悬停媒体区中央，触发箭头渲染（Vue mouseenter）
+    hover_js = f"""
+(() => {{
+    const el = document.querySelector({json.dumps(MEDIA_CONTAINER)})
+        || document.querySelector('.slider-container');
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return {{x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2)}};
+}})()
+"""
+    box = page.evaluate(hover_js)
+    if isinstance(box, dict) and box.get("x") is not None:
+        page.mouse_move(float(box["x"]), float(box["y"]))
+        sleep_random(250, 500)
+
+    # 2. 定位右箭头（forbidden 表示已在最后一张）
+    candidates_js = json.dumps(list(CAROUSEL_NEXT_ARROW_CANDIDATES))
+    target = page.evaluate(f"({_FIND_NEXT_ARROW_JS})({candidates_js})")
+    if not isinstance(target, dict):
+        logger.debug("未找到轮播右箭头（可能未渲染或结构变化）")
+        return False
+    if target.get("forbidden"):
+        logger.debug("右箭头为 forbidden 状态，已在最后一张")
+        return False
+
+    # 3. 鼠标移入箭头并点击
+    x = float(target["x"]) + random.uniform(-3, 3)
+    y = float(target["y"]) + random.uniform(-3, 3)
+    page.mouse_move(x, y)
+    sleep_random(*HOVER_TIME)
+    page.mouse_click(x, y)
+    return True
 
 
 # ========== 数据提取 ==========
