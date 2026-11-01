@@ -15,6 +15,7 @@ metadata:
     os:
       - darwin
       - linux
+      - windows
 ---
 
 # 小红书自动化 Skills
