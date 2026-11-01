@@ -31,6 +31,21 @@ INTERACTION_CONTAINER = ".interaction-container"
 # 页面不可访问容器
 ACCESS_ERROR_WRAPPER = ".access-wrapper, .error-wrapper, .not-found-wrapper, .blocked-wrapper"
 
+# 笔记详情弹窗关闭按钮（连续看帖时先关闭上一篇）
+NOTE_MODAL_CLOSE = ".close-circle"
+
+# ========== 详情页图片轮播（Swiper 实现，箭头仅 hover 时渲染） ==========
+MEDIA_CONTAINER = ".media-container"
+# 右箭头候选（按优先级；"right .btn-wrapper" 来自真实页面 DOM）
+CAROUSEL_NEXT_ARROW_CANDIDATES = (
+    ".slider-container .right .btn-wrapper",
+    ".arrow-controller.right .btn-wrapper",
+    ".arrow-controller.right",
+    ".media-container .right .btn-wrapper",
+)
+# 位置计数器（如 "2/6"，仅 hover 时渲染）
+CAROUSEL_FRACTION = ".fraction"
+
 # ========== 评论输入 ==========
 COMMENT_INPUT_TRIGGER = "div.input-box div.content-edit span"
 COMMENT_INPUT_FIELD = "div.input-box div.content-edit p.content-input"
