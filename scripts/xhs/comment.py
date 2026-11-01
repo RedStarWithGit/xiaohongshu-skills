@@ -7,6 +7,7 @@ import logging
 from .cdp import Page
 from .feed_detail import _check_end_container, _check_page_accessible, _get_comment_count
 from .human import sleep_random
+from .redact import redact_url
 from .selectors import (
     COMMENT_INPUT_FIELD,
     COMMENT_INPUT_TRIGGER,
@@ -32,7 +33,7 @@ def post_comment(page: Page, feed_id: str, xsec_token: str, content: str) -> Non
         RuntimeError: 评论失败。
     """
     url = make_feed_detail_url(feed_id, xsec_token)
-    logger.info("打开 feed 详情页: %s", url)
+    logger.info("打开 feed 详情页: %s", redact_url(url))
 
     page.navigate(url)
     page.wait_for_load()
@@ -87,7 +88,7 @@ def reply_comment(
         raise ValueError("comment_id 和 user_id 至少提供一个")
 
     url = make_feed_detail_url(feed_id, xsec_token)
-    logger.info("打开 feed 详情页进行回复: %s", url)
+    logger.info("打开 feed 详情页进行回复: %s", redact_url(url))
 
     page.navigate(url)
     page.wait_for_load()

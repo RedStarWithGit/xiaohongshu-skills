@@ -15,6 +15,7 @@ import requests
 import websockets.sync.client as ws_client
 
 from .errors import CDPError, ElementNotFoundError
+from .redact import redact_url
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ class Page:
 
     def navigate(self, url: str) -> None:
         """导航到指定 URL。"""
-        logger.info("导航到: %s", url)
+        logger.info("导航到: %s", redact_url(url))
         self._send_session("Page.navigate", {"url": url})
 
     def wait_for_load(self, timeout: float = 60.0) -> None:
@@ -376,15 +377,14 @@ class Page:
 
         在页面执行 JS 生成轨迹，Python 侧控制帧间延迟使时序真实。
         """
-        import math as _math
 
         # 获取视口尺寸
         vw = int(self.evaluate("window.innerWidth || 1280") or 1280)
         vh = int(self.evaluate("window.innerHeight || 800") or 800)
 
-        left   = int(vw * 0.25)
-        right  = int(vw * 0.75)
-        top    = int(vh * 0.20)
+        left = int(vw * 0.25)
+        right = int(vw * 0.75)
+        top = int(vh * 0.20)
         bottom = int(vh * 0.80)
 
         def rand(a: int, b: int) -> int:
@@ -397,7 +397,7 @@ class Page:
         waypoints: list[tuple[int, int, float]] = []  # (x, y, delay_sec)
         cx, cy = rand(left, right), rand(top, top + (bottom - top) // 3)
         line_count = max(3, duration_ms // 600)
-        line_step  = (bottom - top) // line_count
+        line_step = (bottom - top) // line_count
 
         for _ in range(line_count):
             row_end = rand(left + (right - left) // 2, right)
@@ -641,7 +641,8 @@ class Browser:
         if "/" in browser_str:
             self._chrome_version = browser_str.split("/", 1)[1]
 
-        logger.info("连接到 Chrome: %s (version=%s)", ws_url, self._chrome_version)
+        # webSocketDebuggerUrl 含浏览器级调试令牌，不记录完整 URL，只记端口与版本
+        logger.info("连接到 Chrome devtools (port=%s, version=%s)", self.port, self._chrome_version)
         self._cdp = CDPClient(ws_url)
 
     def _setup_page(self, page: Page) -> Page:
