@@ -23,6 +23,13 @@
 
   // ── Cookie 快照 ──────────────────────────────────────────────
 
+  // cookie 值预览：前 4 字符 + 总长（如 abcd…(len=44)）。
+  // 与 netlogger.js / background.js 中的格式保持一致。
+  function cookiePreview(value) {
+    const s = String(value);
+    return s.slice(0, 4) + "…(len=" + s.length + ")";
+  }
+
   function captureCookies() {
     const map = {};
     for (const part of document.cookie.split(";")) {
@@ -38,8 +45,8 @@
       has_webId:       "webId" in map,
       has_gid:         "gid" in map,
       // 部分预览（不暴露完整 token）
-      a1_preview:          map["a1"]          ? map["a1"].slice(0, 12)          + "…" : null,
-      web_session_preview: map["web_session"] ? map["web_session"].slice(0, 10) + "…" : null,
+      a1_preview:          map["a1"]          ? cookiePreview(map["a1"])          : null,
+      web_session_preview: map["web_session"] ? cookiePreview(map["web_session"]) : null,
     };
   }
 
@@ -47,6 +54,25 @@
 
   function urlParam(url, key) {
     try { return new URL(url).searchParams.get(key); } catch (_) { return null; }
+  }
+
+  // URL 脱敏：query 中 xsec_token 值替换为「前 8 字符 + …」（与 netlogger.js 规则一致）
+  function redactUrl(url) {
+    if (typeof url !== "string" || !url.includes("xsec_token=")) return url;
+    try {
+      const u = new URL(url);
+      const t = u.searchParams.get("xsec_token");
+      if (t) u.searchParams.set("xsec_token", t.slice(0, 8) + "…");
+      return u.toString();
+    } catch (_) {
+      return url.replace(/([?&]xsec_token=)([^&]+)/, (_m, p1, p2) => p1 + p2.slice(0, 8) + "…");
+    }
+  }
+
+  // 令牌截断：前 8 字符 + …
+  function redactToken(value) {
+    if (typeof value !== "string" || !value) return value;
+    return value.slice(0, 8) + "…";
   }
 
   function isApiUrl(url) { return XHS_API.test(url); }
@@ -223,12 +249,12 @@
     return {
       id:        `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       timestamp: new Date().toISOString(),
-      url,
+      url:       redactUrl(url),
       method:    method.toUpperCase(),
       status,
-      pageUrl:   window.location.href,
+      pageUrl:   redactUrl(window.location.href),
       request: {
-        xsec_token:    urlParam(url, "xsec_token"),
+        xsec_token:    redactToken(urlParam(url, "xsec_token")),
         xsec_source:   urlParam(url, "xsec_source"),
         has_xs:        !!(headers["xs"]      || headers["X-S"]           || headers["x-s"]),
         has_xt:        !!(headers["xt"]      || headers["X-T"]           || headers["x-t"]),
@@ -446,13 +472,13 @@
       emit({
         id:        `${Date.now()}_render`,
         timestamp: new Date().toISOString(),
-        url,
+        url:       redactUrl(url),
         method:    "GET",
         status:    "200→404",  // HTTP 成功但渲染出 404
-        pageUrl:   url,
+        pageUrl:   redactUrl(url),
         intercept_type: "page_render",
         request: {
-          xsec_token:  xsecToken,
+          xsec_token:  redactToken(xsecToken),
           xsec_source: urlParam(url, "xsec_source"),
           has_xs:      false,
           has_xt:      false,

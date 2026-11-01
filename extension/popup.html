@@ -151,6 +151,25 @@
   <p class="hint" id="hint">正在连接 bridge server...</p>
 
   <hr class="divider">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+    <span style="font-size:12px;font-weight:600;color:#333">Bridge 配对</span>
+    <span class="badge loading" id="pair-status" style="font-size:10px;padding:1px 6px">
+      <span class="dot loading" id="pair-dot"></span>
+      <span id="pair-text">检测中...</span>
+    </span>
+  </div>
+  <div class="row" style="margin-bottom:6px">
+    <span class="label" style="font-size:11px">配对密钥</span>
+    <span class="label" id="secret-state" style="font-size:11px">检测中...</span>
+  </div>
+  <input type="password" id="secret-input" autocomplete="off" placeholder="粘贴 ~/.xhs/bridge_secret 文件内容"
+         style="width:100%;box-sizing:border-box;padding:5px 6px;font-size:11px;border:1px solid #ddd;border-radius:4px;margin-bottom:6px">
+  <div style="display:flex;gap:6px">
+    <button class="btn" id="secret-save" style="flex:1;margin-top:0;font-size:11px;padding:4px 0">保存</button>
+    <button class="btn" id="secret-clear" style="flex:1;margin-top:0;background:#888;font-size:11px;padding:4px 0">清除</button>
+  </div>
+
+  <hr class="divider">
   <button class="btn" id="scan-btn">扫描风控</button>
   <div class="risk-result" id="risk-result" style="display:none">
     <div>风险等级：<span class="risk-badge" id="risk-level-badge">-</span></div>
