@@ -208,6 +208,7 @@ __marimo__/
 
 # Project specific
 tmp/
+cookies.json
 *.txt
 !requirements.txt
 config/accounts.json
